@@ -117,13 +117,57 @@ function saveSessions() {
     }
 }
 
+// Map to track newly created forum topics and route opening prompts typed into the 'All' tab
+const recentCreatedTopics = new Map(); // chatId -> { threadId, topicName, timestamp, handledPrompt, timer }
+
 function extractThreadId(ctx) {
-    const msg = ctx.message ||
-                ctx.callbackQuery?.message ||
-                ctx.channelPost ||
-                ctx.editedMessage ||
-                ctx.msg;
-    return msg?.message_thread_id || null;
+    if (ctx?.state && ctx.state.threadId !== undefined) {
+        return ctx.state.threadId;
+    }
+
+    const msg = ctx?.message ||
+                ctx?.callbackQuery?.message ||
+                ctx?.channelPost ||
+                ctx?.editedMessage ||
+                ctx?.msg;
+
+    let threadId = msg?.message_thread_id || null;
+
+    if (!threadId && msg?.forum_topic_created) {
+        threadId = msg.message_id || null;
+    }
+
+    if (!threadId && msg?.reply_to_message?.message_thread_id) {
+        threadId = msg.reply_to_message.message_thread_id;
+    }
+
+    if (!threadId && msg?.reply_to_message?.forum_topic_created) {
+        threadId = msg.reply_to_message.message_id || null;
+    }
+
+    // Auto-routing for messages sent from the 'All' tab that triggered a new thread:
+    // If a topic was created in this chat within the last 15 seconds, route the incoming prompt
+    // to that newly created topic thread so replies and context stay inside the thread.
+    const chatId = ctx?.chat?.id?.toString();
+    if (!threadId && chatId && recentCreatedTopics.has(chatId)) {
+        const recent = recentCreatedTopics.get(chatId);
+        if (Date.now() - recent.timestamp < 15000) {
+            threadId = recent.threadId;
+            recent.handledPrompt = true;
+            if (ctx?.state) {
+                ctx.state.isInitialTopicTurn = true;
+                ctx.state.topicName = recent.topicName;
+            }
+        } else {
+            recentCreatedTopics.delete(chatId);
+        }
+    }
+
+    if (ctx?.state) {
+        ctx.state.threadId = threadId;
+    }
+
+    return threadId;
 }
 
 function getSessionKey(ctx) {
@@ -253,13 +297,25 @@ bot.use(async (ctx, next) => {
     const threadId = extractThreadId(ctx);
     if (threadId) {
         const origReply = ctx.reply.bind(ctx);
-        ctx.reply = (text, extra = {}) => origReply(text, { message_thread_id: threadId, ...extra });
+        ctx.reply = (text, extra = {}) => {
+            const opts = { message_thread_id: threadId, ...extra };
+            if (!opts.message_thread_id) opts.message_thread_id = threadId;
+            return origReply(text, opts);
+        };
 
         const origReplyWithDocument = ctx.replyWithDocument.bind(ctx);
-        ctx.replyWithDocument = (doc, extra = {}) => origReplyWithDocument(doc, { message_thread_id: threadId, ...extra });
+        ctx.replyWithDocument = (doc, extra = {}) => {
+            const opts = { message_thread_id: threadId, ...extra };
+            if (!opts.message_thread_id) opts.message_thread_id = threadId;
+            return origReplyWithDocument(doc, opts);
+        };
 
         const origSendChatAction = ctx.sendChatAction.bind(ctx);
-        ctx.sendChatAction = (action, extra = {}) => origSendChatAction(action, { message_thread_id: threadId, ...extra });
+        ctx.sendChatAction = (action, extra = {}) => {
+            const opts = { message_thread_id: threadId, ...extra };
+            if (!opts.message_thread_id) opts.message_thread_id = threadId;
+            return origSendChatAction(action, opts);
+        };
     }
     return next();
 });
@@ -318,6 +374,17 @@ bot.use(async (ctx, next) => {
 
     return next();
 });
+
+// Helper: Auto-balance code blocks to avoid Telegram markdown parse errors during streaming
+function balanceMarkdown(text) {
+    if (!text) return text;
+    const fences = (text.match(/```/g) || []).length;
+    let out = text;
+    if (fences % 2 !== 0) {
+        out += '\n```';
+    }
+    return out;
+}
 
 // Helper: Format tool calls cleanly for Antigravity & Grok
 function formatToolCall(name, params = {}) {
@@ -406,12 +473,18 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
     const engine = options.engine || session.engine;
     const isGrok = engine === 'grok';
     const engineLabel = isGrok ? 'Grok' : 'Antigravity';
+    const isInitialTopicTurn = options.isInitialTopicTurn || ctx?.state?.isInitialTopicTurn;
+
+    let startStatus = `🤔 *Starting ${engineLabel} turn...*`;
+    if (isInitialTopicTurn && session.topicName) {
+        startStatus = `🤔 *Starting ${engineLabel} turn in new topic: ${session.topicName}...*`;
+    }
 
     let statusMsg;
     try {
-        statusMsg = await ctx.reply(`🤔 *Starting ${engineLabel} turn...*`, { parse_mode: 'Markdown' });
+        statusMsg = await ctx.reply(startStatus, { parse_mode: 'Markdown' });
     } catch {
-        statusMsg = await ctx.reply(`🤔 Starting ${engineLabel} turn...`);
+        statusMsg = await ctx.reply(startStatus.replace(/[*_`]/g, ''));
     }
 
     const toolCalls = [];
@@ -424,6 +497,10 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
 
     function buildView(isFinal = false) {
         let content = '';
+
+        if (isInitialTopicTurn) {
+            content += `💡 *Initial Topic Prompt:* _${prompt}_\n━━━━━━━━━━━━━━━━\n`;
+        }
 
         if (toolCalls.length > 0) {
             const toolLines = toolCalls.slice(-8).map(t => {
@@ -468,12 +545,14 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             displayContent = displayContent.slice(0, 3800) + '\n\n... *(streaming continuation below)*';
         }
 
+        const formatted = balanceMarkdown(displayContent);
+
         try {
             await ctx.telegram.editMessageText(
                 ctx.chat.id,
                 statusMsg.message_id,
                 null,
-                displayContent,
+                formatted,
                 { parse_mode: 'Markdown' }
             );
         } catch {
@@ -670,8 +749,11 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             await flushUpdate(true);
 
             const fullText = finalResultText || accumulatedText;
-            if (fullText.length > 3800) {
-                const remaining = fullText.slice(3800);
+            const fullView = buildView(true);
+            const prefixLen = Math.max(0, fullView.length - fullText.length);
+            const renderedChars = Math.max(0, 3800 - prefixLen);
+            if (fullText.length > renderedChars) {
+                const remaining = fullText.slice(renderedChars);
                 await sendLongResponse(ctx, remaining);
             }
 
@@ -694,20 +776,53 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
 // Telegram Forum Topic Event Handlers
 // ---------------------------------------------------------------------
 bot.on('forum_topic_created', async (ctx) => {
+    const threadId = extractThreadId(ctx) || ctx.message?.message_thread_id || ctx.message?.message_id;
+    const chatId = ctx.chat?.id?.toString();
+    const topicInfo = ctx.message?.forum_topic_created;
+    const topicName = topicInfo?.name || `Topic #${threadId}`;
+
     const session = getSession(ctx);
-    const topicInfo = ctx.message.forum_topic_created;
-    session.topicName = topicInfo?.name || `Topic #${session.threadId}`;
+    session.topicName = topicName;
     saveSessions();
 
-    await ctx.reply(
-        `🌟 *Topic Session Initialised: ${session.topicName}*\n\n` +
-        `This topic operates as an independent session.\n` +
-        `• Engine: *${getEngineLabel(session)}*\n` +
-        `• Model: \`${getCurrentModel(session)}\`\n` +
-        `• Workspace: \`${session.workspace}\`\n\n` +
-        `Send any message here to start collaborating!`,
-        { parse_mode: 'Markdown' }
-    );
+    if (chatId && threadId) {
+        const existing = recentCreatedTopics.get(chatId);
+        if (existing?.timer) clearTimeout(existing.timer);
+
+        const record = {
+            threadId,
+            topicName,
+            timestamp: Date.now(),
+            handledPrompt: false,
+            timer: null
+        };
+
+        // If the topic was created manually (not from a prompt typed in the 'All' tab),
+        // send the initialisation greeting after 2.5 seconds.
+        // If a prompt arrives within 2.5 seconds, handledPrompt becomes true and we avoid
+        // sending an unnecessary greeting before the AI answer.
+        record.timer = setTimeout(async () => {
+            const current = recentCreatedTopics.get(chatId);
+            if (current && current.threadId === threadId && !current.handledPrompt) {
+                try {
+                    await bot.telegram.sendMessage(
+                        chatId,
+                        `🌟 *Topic Session Initialised: ${topicName}*\n\n` +
+                        `This topic operates as an independent session.\n` +
+                        `• Engine: *${getEngineLabel(session)}*\n` +
+                        `• Model: \`${getCurrentModel(session)}\`\n` +
+                        `• Workspace: \`${session.workspace}\`\n\n` +
+                        `Send any message here to start collaborating!`,
+                        { message_thread_id: threadId, parse_mode: 'Markdown' }
+                    );
+                } catch (err) {
+                    console.error('[Topics] Failed to send topic initialisation message:', err);
+                }
+            }
+        }, 2500);
+
+        recentCreatedTopics.set(chatId, record);
+    }
 });
 
 // ---------------------------------------------------------------------
