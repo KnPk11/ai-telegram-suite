@@ -1,0 +1,15 @@
+[Unit]
+Description=Generic Telegram Terminal Server Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram-terminal
+ExecStart=/usr/bin/node /root/telegram-terminal/bot.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
