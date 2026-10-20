@@ -4,22 +4,29 @@ const readline = require('readline');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const {
+    recordTopicTurn,
+    takeHandoffPrompt,
+    switchEngine,
+    archiveTopicMemory,
+    memoryExists
+} = require('./memory');
+const {
+    parseAllowedUserIds,
+    createAuthMiddleware
+} = require('./auth');
 require('dotenv').config();
 
 const ENV_PATH = path.join(__dirname, '.env');
 const SESSIONS_PATH = path.join(__dirname, 'sessions.json');
+const MEMORY_DIR = path.join(__dirname, 'memory');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
-let ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || '')
-    .split(',')
-    .map(id => id.trim())
-    .filter(Boolean);
+const ALLOWED_CHAT_IDS = parseAllowedUserIds(process.env.ALLOWED_CHAT_IDS || process.env.ALLOWED_USER_IDS || '');
 
-let pairingPin = process.env.PAIRING_PIN || (ALLOWED_CHAT_IDS.length === 0 ? '749216' : null);
-
-const SYSTEM_PATH = '/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
-const AGY_BIN = '/usr/local/bin/agy';
-const GROK_BIN = '/usr/local/bin/grok';
+const SYSTEM_PATH = process.env.SYSTEM_PATH || `${path.join(os.homedir(), '.local', 'bin')}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+const AGY_BIN = process.env.AGY_BIN || '/usr/local/bin/agy';
+const GROK_BIN = process.env.GROK_BIN || '/usr/local/bin/grok';
 
 const AGY_MODELS = [
     { id: 'gemini-3.8-flash-high', label: '⚡ Gemini 3.8 Flash (High)' },
@@ -106,6 +113,7 @@ function saveSessions() {
                 agyConversationId: sess.agyConversationId,
                 grokSessionId: sess.grokSessionId,
                 isNew: sess.isNew,
+                pendingHandoff: Boolean(sess.pendingHandoff),
                 turnCount: sess.turnCount || 0,
                 createdAt: sess.createdAt,
                 lastActive: sess.lastActive
@@ -193,7 +201,7 @@ function getSession(ctx) {
             threadId,
             topicName,
             engine: process.env.DEFAULT_ENGINE || 'agy',
-            workspace: process.env.DEFAULT_WORKSPACE || process.env.DEFAULT_CWD || '/root',
+            workspace: process.env.DEFAULT_WORKSPACE || process.env.DEFAULT_CWD || os.homedir(),
             agyModel: process.env.DEFAULT_AGY_MODEL || 'gemini-3.8-flash-high',
             grokModel: process.env.DEFAULT_GROK_MODEL || 'grok-4.7',
             agyEffort: process.env.DEFAULT_AGY_EFFORT || '',
@@ -201,6 +209,7 @@ function getSession(ctx) {
             agyConversationId: null,
             grokSessionId: null,
             isNew: true,
+            pendingHandoff: false,
             activeProcess: null,
             turnCount: 0,
             createdAt: Date.now(),
@@ -235,18 +244,6 @@ function getTopicDisplayName(session) {
     return 'Main Chat';
 }
 
-function hasGrokSession(dir) {
-    const enc = encodeURIComponent(dir);
-    const p = path.join(os.homedir(), '.grok', 'sessions', enc);
-    if (!fs.existsSync(p)) return false;
-    try {
-        const files = fs.readdirSync(p);
-        return files.some(f => !f.endsWith('.lock') && !f.endsWith('.jsonl'));
-    } catch {
-        return false;
-    }
-}
-
 function getLatestGrokSession(dir, preferredSessionId = null) {
     if (preferredSessionId) return preferredSessionId;
     const enc = encodeURIComponent(dir);
@@ -266,28 +263,6 @@ function getLatestGrokSession(dir, preferredSessionId = null) {
     }
 }
 
-function saveAllowedChatId(newId) {
-    if (!ALLOWED_CHAT_IDS.includes(newId)) {
-        ALLOWED_CHAT_IDS.push(newId);
-    }
-    pairingPin = null;
-
-    try {
-        let envContent = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
-        if (envContent.includes('ALLOWED_CHAT_IDS=')) {
-            envContent = envContent.replace(
-                /ALLOWED_CHAT_IDS=.*/,
-                `ALLOWED_CHAT_IDS=${ALLOWED_CHAT_IDS.join(',')}`
-            );
-        } else {
-            envContent += `\nALLOWED_CHAT_IDS=${ALLOWED_CHAT_IDS.join(',')}\n`;
-        }
-        fs.writeFileSync(ENV_PATH, envContent, 'utf8');
-        console.log(`[Security] Successfully paired chat ID ${newId}`);
-    } catch (err) {
-        console.error('[Security] Failed to save .env file:', err);
-    }
-}
 
 // ---------------------------------------------------------------------
 // Middleware 1: Thread Routing Enforcer
@@ -322,58 +297,10 @@ bot.use(async (ctx, next) => {
 
 // ---------------------------------------------------------------------
 // Middleware 2: Authorisation Middleware
-// Supports pairing via PIN and auto-authorises topics from allowed users
+// Strictly verifies individual user IDs (fromId).
+// Never authorises entire groups or channels.
 // ---------------------------------------------------------------------
-bot.use(async (ctx, next) => {
-    const chatId = ctx.chat?.id?.toString();
-    const fromId = ctx.from?.id?.toString();
-    if (!chatId) return;
-
-    const text = ctx.message?.text?.trim() || '';
-    if (text.startsWith('/pair')) {
-        const parts = text.split(/\s+/);
-        const enteredPin = parts[1];
-
-        if (pairingPin && enteredPin === pairingPin) {
-            saveAllowedChatId(chatId);
-            const session = getSession(ctx);
-            await ctx.reply(
-                `🎉 *Device Successfully Paired!*\n\n` +
-                `Welcome to *AI Terminal Suite*.\n` +
-                `Active Engine: *${getEngineLabel(session)}*\n` +
-                `Active Workspace: \`${session.workspace}\`\n` +
-                `Active Model: \`${getCurrentModel(session)}\`\n\n` +
-                `Send any message to chat with the agent!`,
-                { parse_mode: 'Markdown' }
-            );
-            return;
-        } else {
-            await ctx.reply('❌ Invalid pairing PIN.');
-            return;
-        }
-    }
-
-    // Auto-authorise group or topic if initiated by an already approved user
-    if (fromId && ALLOWED_CHAT_IDS.includes(fromId) && !ALLOWED_CHAT_IDS.includes(chatId)) {
-        saveAllowedChatId(chatId);
-    }
-
-    if (ALLOWED_CHAT_IDS.length === 0) {
-        await ctx.reply(
-            `🔒 *Bot Not Yet Paired*\n\nYour Chat ID: \`${chatId}\`\nSend \`/pair <PIN>\` to link.`,
-            { parse_mode: 'Markdown' }
-        );
-        return;
-    }
-
-    const isAuthorised = ALLOWED_CHAT_IDS.includes(chatId) || (fromId && ALLOWED_CHAT_IDS.includes(fromId));
-    if (!isAuthorised) {
-        await ctx.reply(`⛔ *Unauthorised Access*\nYour Chat ID: \`${chatId}\``, { parse_mode: 'Markdown' });
-        return;
-    }
-
-    return next();
-});
+bot.use(createAuthMiddleware(ALLOWED_CHAT_IDS));
 
 // Helper: Auto-balance code blocks to avoid Telegram markdown parse errors during streaming
 function balanceMarkdown(text) {
@@ -490,6 +417,28 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
     const toolCalls = [];
     let accumulatedText = '';
     let finalResultText = null;
+    const handoff = takeHandoffPrompt(session, prompt, MEMORY_DIR);
+    const modelPrompt = handoff.prompt;
+    if (handoff.consumed) saveSessions();
+
+    let turnRecorded = false;
+    function recordFinishedTurn(exitCode, failureText) {
+        if (turnRecorded) return;
+        turnRecorded = true;
+        if (!String(prompt || '').trim()) return;
+        try {
+            recordTopicTurn(MEMORY_DIR, session, {
+                engine,
+                request: prompt,
+                outcome: failureText || finalResultText || accumulatedText,
+                toolCalls,
+                exitCode
+            });
+            console.log(`[Memory] Recorded turn for ${session.id}`);
+        } catch (err) {
+            console.error('[Memory] Failed to record topic turn:', err);
+        }
+    }
     let lastRenderedContent = '';
     let lastEditTime = 0;
     let editPending = false;
@@ -592,11 +541,10 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
                 '--output-format', 'streaming-json'
             );
 
-            // Per-topic session continuity for Grok
+            // Resume this topic's own Grok session. A workspace-wide continue
+            // would attach another topic that shares the same directory.
             if (!options.isNew && session.grokSessionId) {
                 args.push('--resume', session.grokSessionId);
-            } else if (!options.isNew && hasGrokSession(session.workspace)) {
-                args.push('-c');
             }
 
             const model = options.model || session.grokModel;
@@ -609,7 +557,7 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
                 args.push('--effort', effort);
             }
 
-            args.push('-p', prompt);
+            args.push('-p', modelPrompt);
         } else {
             bin = AGY_BIN;
             args.push(
@@ -617,11 +565,9 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
                 '--dangerously-skip-permissions'
             );
 
-            // Per-topic session continuity for Antigravity (Gemini)
+            // Resume this topic's own Antigravity conversation.
             if (!options.isNew && session.agyConversationId) {
                 args.push('--conversation', session.agyConversationId);
-            } else if (!options.isNew) {
-                args.push('-c');
             }
 
             const model = options.model || session.agyModel;
@@ -638,7 +584,7 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
                 args.push('--mode', options.mode);
             }
 
-            args.push('-p', prompt);
+            args.push('-p', modelPrompt);
         }
 
         const child = spawn(bin, args, {
@@ -745,6 +691,7 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             session.turnCount = (session.turnCount || 0) + 1;
             session.lastActive = Date.now();
             saveSessions();
+            recordFinishedTurn(code);
 
             await flushUpdate(true);
 
@@ -766,6 +713,7 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             clearInterval(typingInterval);
             session.activeProcess = null;
             saveSessions();
+            recordFinishedTurn(-1, err.message);
             await ctx.reply(`❌ Process error: ${err.message}`);
             resolve(-1);
         });
@@ -908,18 +856,21 @@ bot.command('engine', async (ctx) => {
 bot.action(/^set_engine:(agy|grok)$/, async (ctx) => {
     const session = getSession(ctx);
     const selected = ctx.match[1];
-    session.engine = selected;
-    session.isNew = true; // reset session for the switched engine in this topic
-    session.agyConversationId = null;
-    session.grokSessionId = null;
+    const { resumed } = switchEngine(session, selected);
     saveSessions();
+
+    const continuity = resumed
+        ? 'Resuming this engine\'s existing session for the topic.'
+        : (memoryExists(MEMORY_DIR, session.id)
+            ? 'This engine has no session in the topic yet. The next message includes the topic memory.'
+            : 'This engine has no session in the topic yet. The next message starts a new session.');
 
     await ctx.answerCbQuery(`Switched to ${getEngineLabel(session)}`);
     await ctx.editMessageText(
         `✅ *Engine updated for ${getTopicDisplayName(session)}:* *${getEngineLabel(session)}*\n\n` +
         `• Model: \`${getCurrentModel(session)}\`\n` +
         `• Effort: \`${getCurrentEffort(session) || 'Default'}\`\n` +
-        `• Conversation context initialised for ${getEngineLabel(session)}.`,
+        `• ${continuity}`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -1012,6 +963,108 @@ bot.action(/^set_effort:(.+)$/, async (ctx) => {
     );
 });
 
+// Account billing. The TUI calls this x.ai/billing; on agent stdio the method is _x.ai/billing.
+function fetchGrokBilling(cwd) {
+    return new Promise((resolve) => {
+        const proc = spawn(GROK_BIN, ['agent', '--always-approve', '--no-leader', 'stdio'], {
+            cwd: cwd || '/tmp',
+            env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
+        });
+        const rl = readline.createInterface({ input: proc.stdout });
+        const pending = new Map();
+        let nextId = 1;
+        let settled = false;
+
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            rl.close();
+            try { proc.stdin.end(); } catch {}
+            proc.kill();
+            resolve(value);
+        };
+
+        const timer = setTimeout(() => finish(null), 20000);
+
+        function request(method, params) {
+            const id = nextId++;
+            return new Promise((res, rej) => {
+                const t = setTimeout(() => rej(new Error(`timeout ${method}`)), 15000);
+                pending.set(id, (msg) => {
+                    clearTimeout(t);
+                    if (msg.error) rej(new Error(msg.error.message || method));
+                    else res(msg.result);
+                });
+                proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+            });
+        }
+
+        rl.on('line', (line) => {
+            let msg;
+            try { msg = JSON.parse(line); } catch { return; }
+            if (msg.id != null && pending.has(msg.id)) {
+                const cb = pending.get(msg.id);
+                pending.delete(msg.id);
+                cb(msg);
+            }
+        });
+
+        proc.on('error', () => finish(null));
+        proc.on('close', () => finish(null));
+
+        (async () => {
+            try {
+                await request('initialize', {
+                    protocolVersion: 1,
+                    clientCapabilities: { fs: { readTextFile: true }, terminal: true },
+                    clientInfo: { name: 'telegram-terminal', version: '1' }
+                });
+                const billing = await request('_x.ai/billing', {});
+                finish(billing);
+            } catch {
+                finish(null);
+            }
+        })();
+    });
+}
+
+function formatBillingWhen(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    return d.toLocaleString('en-GB', {
+        timeZone: 'UTC',
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    });
+}
+
+function formatGrokBilling(billing) {
+    const config = billing && billing.config;
+    if (!config) return '\n\n*Weekly account* (`x.ai/billing`): unavailable';
+    const period = config.currentPeriod || {};
+    const start = config.billingPeriodStart || period.start;
+    const end = config.billingPeriodEnd || period.end;
+    const lines = ['*Weekly account* (`x.ai/billing`):'];
+    if (billing.subscription_tier) lines.push(`• *Tier:* ${billing.subscription_tier}`);
+    if (config.creditUsagePercent != null) {
+        lines.push(`• *Used:* ${Math.round(Number(config.creditUsagePercent))}%`);
+    }
+    if (start && end) {
+        lines.push(`• *Window:* ${formatBillingWhen(start)} → ${formatBillingWhen(end)} UTC`);
+    }
+    const onDemandUsed = Number(config.onDemandUsed && config.onDemandUsed.val) || 0;
+    const onDemandCap = Number(config.onDemandCap && config.onDemandCap.val) || 0;
+    const prepaid = Number(config.prepaidBalance && config.prepaidBalance.val) || 0;
+    if (onDemandUsed || onDemandCap) lines.push(`• *On-demand:* ${onDemandUsed} / ${onDemandCap}`);
+    if (prepaid) lines.push(`• *Prepaid:* ${prepaid}`);
+    return '\n\n' + lines.join('\n');
+}
+
 // /usage and /quota commands
 bot.command(['usage', 'quota'], async (ctx) => {
     const session = getSession(ctx);
@@ -1023,9 +1076,14 @@ bot.command(['usage', 'quota'], async (ctx) => {
     try {
         if (session.engine === 'grok') {
             const sid = session.grokSessionId || getLatestGrokSession(session.workspace);
+            const billingPromise = fetchGrokBilling(session.workspace);
             if (!sid) {
+                const billingText = formatGrokBilling(await billingPromise);
                 clearInterval(typingInterval);
-                await ctx.reply(`📊 *Grok Usage*\n\nNo recorded Grok session in \`${session.workspace}\` yet.`, { parse_mode: 'Markdown' });
+                await ctx.reply(
+                    `📊 *Grok Usage*\n\nNo recorded Grok session in \`${session.workspace}\` yet.${billingText}`,
+                    { parse_mode: 'Markdown' }
+                );
                 return;
             }
 
@@ -1039,6 +1097,7 @@ bot.command(['usage', 'quota'], async (ctx) => {
             p.stdout.on('data', d => { stdout += d.toString(); });
             p.on('close', async () => {
                 clearInterval(typingInterval);
+                const billingText = formatGrokBilling(await billingPromise);
                 try {
                     const u = JSON.parse(stdout);
                     const s = u.session || {};
@@ -1054,10 +1113,11 @@ bot.command(['usage', 'quota'], async (ctx) => {
                         `• Output: ${(s.outputTokens || 0).toLocaleString()}\n` +
                         `• Reasoning: ${(s.reasoningTokens || 0).toLocaleString()}\n` +
                         `• Cached Read: ${(s.cachedReadTokens || 0).toLocaleString()}\n` +
-                        `• Total Tokens: ${(s.totalTokens || 0).toLocaleString()}`;
+                        `• Total Tokens: ${(s.totalTokens || 0).toLocaleString()}` +
+                        billingText;
                     await ctx.reply(msg, { parse_mode: 'Markdown' });
                 } catch {
-                    await ctx.reply(`📊 *Grok Usage*\n\`\`\`\n${stdout.trim()}\n\`\`\``, { parse_mode: 'Markdown' });
+                    await ctx.reply(`📊 *Grok Usage*\n\`\`\`\n${stdout.trim()}\n\`\`\`${billingText}`, { parse_mode: 'Markdown' });
                 }
             });
         } else {
@@ -1174,14 +1234,20 @@ bot.command('credits', async (ctx) => {
 // /new command: start fresh session for the CURRENT topic
 bot.command('new', async (ctx) => {
     const session = getSession(ctx);
+    const archived = archiveTopicMemory(MEMORY_DIR, session.id);
     session.isNew = true;
+    session.pendingHandoff = false;
     session.agyConversationId = null;
     session.grokSessionId = null;
     session.turnCount = 0;
     saveSessions();
 
+    const archiveNote = archived
+        ? 'The previous topic memory was archived.'
+        : 'No topic memory was on file.';
     await ctx.reply(
         `🆕 *Conversation reset for ${getTopicDisplayName(session)}.*\n` +
+        `${archiveNote}\n` +
         `Your next prompt in this topic will start a fresh session with *${getEngineLabel(session)}*.`,
         { parse_mode: 'Markdown' }
     );
@@ -1380,13 +1446,13 @@ bot.command('start', async (ctx) => {
         `• Send any text to prompt the active agent in this topic\n` +
         `• Live tool execution updates & streaming text!\n` +
         `• Dedicated session history per topic\n` +
-        `• \`/engine\` — Switch between Google Antigravity & xAI Grok\n` +
+        `• \`/engine\` — Switch engine. Each engine keeps its own session; a new engine gets the topic memory\n` +
         `• \`/model\` — Switch model via inline buttons\n` +
         `• \`/sessions\` — View all active topics & sessions\n` +
         `• \`/name <title>\` — Set nickname for this topic\n` +
-        `• \`/usage\` — Check usage stats & quotas\n` +
+        `• \`/usage\` — Session stats, plus the weekly account window on Grok\n` +
         `• \`/effort\` — Switch reasoning effort\n` +
-        `• \`/new\` — Reset conversation context for this topic\n` +
+        `• \`/new\` — Archive topic memory and start a fresh session\n` +
         `• \`/plan <task>\` — Generate implementation plan\n` +
         `• \`/skills\` — View available agent skills\n` +
         `• \`/workspace <path>\` — Switch directory for this topic\n` +
@@ -1405,11 +1471,11 @@ bot.command('help', async (ctx) => {
         `*(Any text)* — Send prompt with real-time updates\n` +
         `\`/sessions\` or \`/topics\` — View all active topics and sessions\n` +
         `\`/name <title>\` — View or set nickname for current topic\n` +
-        `\`/engine\` — Switch between Antigravity (Google) & Grok (xAI)\n` +
+        `\`/engine\` — Switch engine. An engine with no session here receives the topic memory\n` +
         `\`/model\` — Select active AI model for this topic\n` +
-        `\`/usage\` or \`/quota\` — View token usage & rate limits\n` +
+        `\`/usage\` or \`/quota\` — Session tokens, plus the weekly account window on Grok\n` +
         `\`/effort\` — Select reasoning effort tier\n` +
-        `\`/new\` — Start a fresh session for this topic\n` +
+        `\`/new\` — Archive topic memory and start fresh in this topic\n` +
         `\`/plan <task>\` — Run in plan-only mode\n` +
         `\`/skills\` — View available skills\n` +
         `\`/workspace <path>\` — Switch workspace folder for this topic\n` +
@@ -1529,7 +1595,7 @@ async function startBot() {
             { command: 'model', description: 'Switch AI model' },
             { command: 'sessions', description: 'List active topic sessions' },
             { command: 'name', description: 'Name or rename current topic' },
-            { command: 'usage', description: 'Check usage and quota statistics' },
+            { command: 'usage', description: 'Session stats and weekly account usage' },
             { command: 'effort', description: 'Change reasoning effort tier' },
             { command: 'new', description: 'Start a fresh conversation in this topic' },
             { command: 'plan', description: 'Generate implementation plan' },

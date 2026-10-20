@@ -3,3 +3,4 @@ node_modules/
 *.log
 sessions.json
 bot.js.bak
+memory/

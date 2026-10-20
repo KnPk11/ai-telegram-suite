@@ -18,7 +18,9 @@ Designed specifically to solve mobile SSH pain points and provide isolated, para
 2. **Dual AI Engines**:
    - **Google Antigravity (`agy`)**: Gemini 3.8 Flash, Gemini 3.1 Pro, Claude Sonnet 4.6, Claude Opus 4.6 Thinking, and GPT-OSS 120B.
    - **xAI Grok (`grok`)**: Grok 4.7, Grok 4.7 Fast, Grok 4.6, and Grok 4.5.
-   - Switch engine seamlessly per topic via `/engine`.
+   - Switch engine per topic via `/engine`. Each engine keeps its own session id, so switching back resumes that transcript.
+   - After every turn the topic gets a short memory file in `memory/<chat>_<thread>.md`. That file is sent only when the destination engine has no session of its own.
+   - `/new` archives the memory file and clears both engine sessions.
 
 3. **Live Streaming & Tool Visualisation**:
    - Real-time message streaming updates with tool call status badges (`run_command`, `read_file`, `edit_file`, `web_fetch`).
@@ -43,10 +45,10 @@ Designed specifically to solve mobile SSH pain points and provide isolated, para
 | *(Any message)* | Prompt the AI agent in the current topic |
 | `/sessions` or `/topics` | List all active topic sessions in this chat |
 | `/name <title>` | View or set a nickname for the current topic |
-| `/engine` | Switch between Antigravity (Gemini) and Grok |
+| `/engine` | Switch between Antigravity (Gemini) and Grok. A new engine receives the topic memory |
 | `/model` | Select active AI model for this topic |
 | `/effort` | Select reasoning effort tier (Default, Low, Medium, High, Max) |
-| `/new` | Reset conversation context for the current topic |
+| `/new` | Archive topic memory and start a fresh session |
 | `/plan <task>` | Run in plan-only mode |
 | `/usage` or `/quota` | Query token usage and rate limits |
 | `/skills` | View available agent skills |
@@ -57,6 +59,23 @@ Designed specifically to solve mobile SSH pain points and provide isolated, para
 | `/stop` | Abort active agent task in this topic (`/stop all` to abort all) |
 | `/status` | View server load, memory, and running tasks |
 | `/help` | Display command reference |
+
+---
+
+## Security & Authorisation
+
+Access to the daemon is strictly controlled to prevent unauthorised host execution:
+
+1. **User ID Verification (`fromId`)**:
+   - Authorisation is tied strictly to sender numeric user IDs in `ALLOWED_CHAT_IDS` (`.env`).
+   - Group and channel IDs (negative numbers) are filtered out and never authorised.
+   - Using the bot in a group chat or forum topic does **not** grant access to other group members.
+   - Casual chatter from unapproved users in shared groups is silently ignored to avoid spam; unauthorised command attempts and inline button clicks are blocked.
+
+2. **PIN Pairing Disabled**:
+   - The `/pair` command and dynamic pairing PINs have been permanently removed to eliminate brute-force attack vectors. Authorised users must be provisioned directly by the system administrator.
+
+For the detailed threat model and verification test suite, see [SECURITY.md](SECURITY.md).
 
 ---
 

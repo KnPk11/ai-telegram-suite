@@ -1,12 +1,13 @@
 [Unit]
-Description=Generic Telegram Terminal Server Daemon
+Description=AI Telegram Terminal Suite Daemon
 After=network.target
 
 [Service]
 Type=simple
+# Replace with your system user and installation path
 User=root
-WorkingDirectory=/root/telegram-terminal
-ExecStart=/usr/bin/node /root/telegram-terminal/bot.js
+WorkingDirectory=/opt/telegram-terminal
+ExecStart=/usr/bin/node /opt/telegram-terminal/bot.js
 Restart=always
 RestartSec=5
 Environment=NODE_ENV=production
