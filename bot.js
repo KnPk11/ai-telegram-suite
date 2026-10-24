@@ -1104,9 +1104,8 @@ function formatGrokBilling(billing) {
     const end = config.billingPeriodEnd || period.end;
     const lines = ['*Weekly account* (`x.ai/billing`):'];
     if (billing.subscription_tier) lines.push(`• *Tier:* ${billing.subscription_tier}`);
-    if (config.creditUsagePercent != null) {
-        lines.push(`• *Used:* ${Math.round(Number(config.creditUsagePercent))}%`);
-    }
+    const usedPct = Math.round(Number(config.creditUsagePercent ?? 0));
+    lines.push(`• *Used:* ${usedPct}% (${Math.max(0, 100 - usedPct)}% remaining)`);
     if (start && end) {
         lines.push(`• *Window:* ${formatBillingWhen(start)} → ${formatBillingWhen(end)} UTC`);
     }
