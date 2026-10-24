@@ -15,6 +15,10 @@ const {
     parseAllowedUserIds,
     createAuthMiddleware
 } = require('./auth');
+const {
+    createModelCatalogue,
+    formatModelLabel
+} = require('./models');
 require('dotenv').config();
 
 const ENV_PATH = path.join(__dirname, '.env');
@@ -28,21 +32,11 @@ const SYSTEM_PATH = process.env.SYSTEM_PATH || `${path.join(os.homedir(), '.loca
 const AGY_BIN = process.env.AGY_BIN || '/usr/local/bin/agy';
 const GROK_BIN = process.env.GROK_BIN || '/usr/local/bin/grok';
 
-const AGY_MODELS = [
-    { id: 'gemini-3.8-flash-high', label: '⚡ Gemini 3.8 Flash (High)' },
-    { id: 'gemini-3.8-flash-medium', label: '⚡ Gemini 3.8 Flash (Med)' },
-    { id: 'gemini-3.1-pro-high', label: '🧠 Gemini 3.1 Pro (High)' },
-    { id: 'claude-sonnet-4-6', label: '🎭 Claude Sonnet 4.6' },
-    { id: 'claude-opus-4-6-thinking', label: '👑 Claude Opus 4.6' },
-    { id: 'gpt-oss-120b-medium', label: '🌐 GPT-OSS 120B' }
-];
-
-const GROK_MODELS = [
-    { id: 'grok-4.7', label: '⚡ Grok 4.7 (Default)' },
-    { id: 'grok-4.7-build-fast', label: '🏎️ Grok 4.7 Fast' },
-    { id: 'grok-4.6', label: '🧠 Grok 4.6' },
-    { id: 'grok-4.5', label: '💡 Grok 4.5' }
-];
+// Model lists are fetched live from `agy models` / `grok models` (see models.js).
+const modelCatalogue = createModelCatalogue({
+    bins: { agy: AGY_BIN, grok: GROK_BIN },
+    env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
+});
 
 const AGY_EFFORTS = [
     { id: '', label: 'Default' },
@@ -721,6 +715,43 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
 }
 
 // ---------------------------------------------------------------------
+// Non-blocking turn launcher
+// Telegraf's polling loop waits for each update handler to finish before it
+// fetches more updates, so awaiting a long agent turn would freeze the whole
+// bot (including /stop, /model and other topics). Turns are therefore started
+// in the background. `session.turnStarting` closes the gap between launch and
+// the child process being spawned, so a topic still runs one turn at a time.
+// ---------------------------------------------------------------------
+function isSessionBusy(session) {
+    return Boolean(session.activeProcess || session.turnStarting);
+}
+
+function startAgentTurn(ctx, session, prompt, options = {}) {
+    if (isSessionBusy(session)) return false;
+
+    const isNew = session.isNew;
+    session.isNew = false;
+    session.turnStarting = true;
+
+    runAgentStreamTurn(ctx, prompt, {
+        session,
+        model: getCurrentModel(session),
+        effort: getCurrentEffort(session),
+        isNew,
+        ...options
+    })
+        .catch(async (err) => {
+            console.error(`[Turn] Unhandled error in ${session.id}:`, err);
+            try { await ctx.reply(`❌ Turn failed: ${err.message}`); } catch {}
+        })
+        .finally(() => {
+            session.turnStarting = false;
+        });
+
+    return true;
+}
+
+// ---------------------------------------------------------------------
 // Telegram Forum Topic Event Handlers
 // ---------------------------------------------------------------------
 bot.on('forum_topic_created', async (ctx) => {
@@ -791,7 +822,7 @@ bot.command(['sessions', 'topics'], async (ctx) => {
     const lines = chatSessions.map(s => {
         const isCurrent = s.id === currentSession.id;
         const name = getTopicDisplayName(s);
-        const status = s.activeProcess ? '⚙️ Running' : '💤 Idle';
+        const status = isSessionBusy(s) ? '⚙️ Running' : '💤 Idle';
         const engineLabel = s.engine === 'grok' ? 'Grok' : 'Antigravity';
         const model = s.engine === 'grok' ? s.grokModel : s.agyModel;
         return `${isCurrent ? '👉 ' : '• '}*${name}* [${status}]\n   Engine: ${engineLabel} | Model: \`${model}\` | Turns: ${s.turnCount || 0}`;
@@ -875,29 +906,51 @@ bot.action(/^set_engine:(agy|grok)$/, async (ctx) => {
     );
 });
 
-// /model command: inline buttons tailored to active engine for the topic
-bot.command('model', async (ctx) => {
-    const session = getSession(ctx);
-    const isGrok = session.engine === 'grok';
-    const models = isGrok ? GROK_MODELS : AGY_MODELS;
+// /model command: inline buttons built from the live model list of the active engine
+async function buildModelMenu(session, { force = false } = {}) {
+    const engine = session.engine === 'grok' ? 'grok' : 'agy';
+    const { models, source } = await modelCatalogue.getModels(engine, { force });
     const activeModel = getCurrentModel(session);
 
     const buttons = models.map(m => [
         Markup.button.callback(
-            `${m.id === activeModel ? '✅ ' : ''}${m.label}`,
+            `${m.id === activeModel ? '✅ ' : ''}${formatModelLabel(engine, m)}`,
             `set_model:${m.id}`
         )
     ]);
+    buttons.push([Markup.button.callback('🔄 Refresh list', 'refresh_models')]);
 
-    await ctx.reply(
+    let text =
         `🤖 *Select AI Model (${getEngineLabel(session)})*\n` +
         `📌 *Topic:* *${getTopicDisplayName(session)}*\n` +
-        `Current model: \`${activeModel}\``,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard(buttons)
-        }
-    );
+        `Current model: \`${activeModel}\``;
+    if (activeModel && !models.some(m => m.id === activeModel)) {
+        text += `\n⚠️ Current model is no longer offered by the CLI.`;
+    }
+    if (source === 'fallback') {
+        text += `\n⚠️ Could not fetch the live list; showing the built-in fallback.`;
+    }
+
+    return { text, extra: { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) } };
+}
+
+bot.command('model', async (ctx) => {
+    const session = getSession(ctx);
+    ctx.sendChatAction('typing').catch(() => {});
+    const { text, extra } = await buildModelMenu(session);
+    await ctx.reply(text, extra);
+});
+
+bot.action('refresh_models', async (ctx) => {
+    const session = getSession(ctx);
+    await ctx.answerCbQuery('Refreshing model list...');
+    const { text, extra } = await buildModelMenu(session, { force: true });
+    try {
+        await ctx.editMessageText(text, extra);
+    } catch (err) {
+        // Telegram rejects edits that change nothing; that just means the list is unchanged.
+        if (!String(err.description || err.message).includes('not modified')) throw err;
+    }
 });
 
 bot.action(/^set_model:(.+)$/, async (ctx) => {
@@ -1262,21 +1315,9 @@ bot.command('plan', async (ctx) => {
         return;
     }
 
-    if (session.activeProcess) {
+    if (!startAgentTurn(ctx, session, task, { mode: 'plan' })) {
         await ctx.reply('⚠️ Agent is currently busy in this topic. Use `/stop` to abort if needed.');
-        return;
     }
-
-    const isNew = session.isNew;
-    session.isNew = false;
-
-    await runAgentStreamTurn(ctx, task, {
-        session,
-        model: getCurrentModel(session),
-        effort: getCurrentEffort(session),
-        mode: 'plan',
-        isNew
-    });
 });
 
 // /workspace or /cd command
@@ -1307,8 +1348,8 @@ bot.command('pwd', async (ctx) => {
 // /status command
 bot.command('status', async (ctx) => {
     const session = getSession(ctx);
-    const isTopicBusy = session.activeProcess !== null;
-    const runningSessions = Object.values(sessions).filter(s => s.activeProcess !== null);
+    const isTopicBusy = isSessionBusy(session);
+    const runningSessions = Object.values(sessions).filter(isSessionBusy);
 
     const cpus = os.cpus().length;
     const freeMemMb = Math.round(os.freemem() / 1024 / 1024);
@@ -1513,17 +1554,13 @@ bot.on(['document', 'photo'], async (ctx) => {
 
         const caption = ctx.message.caption?.trim();
         if (caption) {
-            await ctx.reply(`📥 Saved \`${fileName}\`. Prompting ${getEngineLabel(session)} with caption...`, { parse_mode: 'Markdown' });
             const prompt = `I uploaded a file to the workspace at ${fileName}. ${caption}`;
-            const isNew = session.isNew;
-            session.isNew = false;
-
-            await runAgentStreamTurn(ctx, prompt, {
-                session,
-                model: getCurrentModel(session),
-                effort: getCurrentEffort(session),
-                isNew
-            });
+            if (isSessionBusy(session)) {
+                await ctx.reply(`📥 Saved \`${fileName}\`, but the agent is busy in this topic so the caption was not sent. Use \`/stop\` or resend once it finishes.`, { parse_mode: 'Markdown' });
+                return;
+            }
+            await ctx.reply(`📥 Saved \`${fileName}\`. Prompting ${getEngineLabel(session)} with caption...`, { parse_mode: 'Markdown' });
+            startAgentTurn(ctx, session, prompt);
         } else {
             await ctx.reply(`📥 Uploaded and saved to workspace:\n\`${destination}\``, { parse_mode: 'Markdown' });
         }
@@ -1567,24 +1604,17 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    if (session.activeProcess) {
+    if (!startAgentTurn(ctx, session, text)) {
         await ctx.reply(`⚠️ Agent is currently busy in ${getTopicDisplayName(session)}. Use \`/stop\` to abort the active turn.`);
-        return;
     }
-
-    const isNew = session.isNew;
-    session.isNew = false;
-
-    await runAgentStreamTurn(ctx, text, {
-        session,
-        model: getCurrentModel(session),
-        effort: getCurrentEffort(session),
-        isNew
-    });
 });
 
 async function startBot() {
     loadSessions();
+
+    // Pre-fetch model lists in the background so the first /model is instant.
+    modelCatalogue.getModels('agy').catch(() => {});
+    modelCatalogue.getModels('grok').catch(() => {});
 
     console.log(`AI Terminal Suite starting with Dual-Engine (Antigravity & Grok) and Multi-Topic support.`);
 
