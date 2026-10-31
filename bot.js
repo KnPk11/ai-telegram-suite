@@ -19,6 +19,14 @@ const {
     createModelCatalogue,
     formatModelLabel
 } = require('./models');
+const {
+    sanitizeTopicTitle,
+    isGenericTopicTitle,
+    isPromptEchoTitle,
+    readFirstPromptFromMemory,
+    resolveSessionTitle,
+    renameForumTopicOnTelegram
+} = require('./titles');
 require('dotenv').config();
 
 const ENV_PATH = path.join(__dirname, '.env');
@@ -108,6 +116,8 @@ function saveSessions() {
                 grokSessionId: sess.grokSessionId,
                 isNew: sess.isNew,
                 pendingHandoff: Boolean(sess.pendingHandoff),
+                customTopicName: Boolean(sess.customTopicName),
+                autoTitled: Boolean(sess.autoTitled),
                 turnCount: sess.turnCount || 0,
                 createdAt: sess.createdAt,
                 lastActive: sess.lastActive
@@ -150,17 +160,31 @@ function extractThreadId(ctx) {
     // Auto-routing for messages sent from the 'All' tab that triggered a new thread:
     // If a topic was created in this chat within the last 15 seconds, route the incoming prompt
     // to that newly created topic thread so replies and context stay inside the thread.
+    // Also mark `handledPrompt = true` whenever any non-service message arrives for that topic
+    // (even if `message_thread_id` was already populated by Telegram) so the 2.5s greeting timer
+    // does not fire on top of an active turn or command.
     const chatId = ctx?.chat?.id?.toString();
-    if (!threadId && chatId && recentCreatedTopics.has(chatId)) {
+    if (chatId && recentCreatedTopics.has(chatId)) {
         const recent = recentCreatedTopics.get(chatId);
         if (Date.now() - recent.timestamp < 15000) {
-            threadId = recent.threadId;
-            recent.handledPrompt = true;
-            if (ctx?.state) {
-                ctx.state.isInitialTopicTurn = true;
-                ctx.state.topicName = recent.topicName;
+            if (!msg?.forum_topic_created) {
+                if (!threadId) {
+                    threadId = recent.threadId;
+                    if (ctx?.state) {
+                        ctx.state.isInitialTopicTurn = true;
+                        ctx.state.topicName = recent.topicName;
+                    }
+                }
+                if (Number(threadId) === Number(recent.threadId)) {
+                    recent.handledPrompt = true;
+                    if (recent.timer) {
+                        clearTimeout(recent.timer);
+                        recent.timer = null;
+                    }
+                }
             }
         } else {
+            if (recent.timer) clearTimeout(recent.timer);
             recentCreatedTopics.delete(chatId);
         }
     }
@@ -178,6 +202,42 @@ function getSessionKey(ctx) {
     return threadId ? `${chatId}_${threadId}` : `${chatId}_main`;
 }
 
+function getChatDefaults(chatId) {
+    const mainSession = sessions[`${chatId}_main`];
+    return {
+        engine: mainSession?.engine || process.env.DEFAULT_ENGINE || 'agy',
+        workspace: mainSession?.workspace || process.env.DEFAULT_WORKSPACE || process.env.DEFAULT_CWD || os.homedir(),
+        agyModel: mainSession?.agyModel || process.env.DEFAULT_AGY_MODEL || 'gemini-3.8-flash-high',
+        grokModel: mainSession?.grokModel || process.env.DEFAULT_GROK_MODEL || 'grok-4.7',
+        agyEffort: mainSession?.agyEffort ?? (process.env.DEFAULT_AGY_EFFORT || ''),
+        grokEffort: mainSession?.grokEffort ?? (process.env.DEFAULT_GROK_EFFORT || '')
+    };
+}
+
+function isUntouchedTopicSession(sess) {
+    return Boolean(
+        sess &&
+        sess.threadId &&
+        (sess.turnCount || 0) === 0 &&
+        !sess.agyConversationId &&
+        !sess.grokSessionId &&
+        !isSessionBusy(sess)
+    );
+}
+
+function updateChatDefaults(chatId, patch) {
+    if (!chatId || !patch || typeof patch !== 'object') return;
+    const mainKey = `${chatId}_main`;
+    if (sessions[mainKey]) {
+        Object.assign(sessions[mainKey], patch, { lastActive: Date.now() });
+    }
+    for (const sess of Object.values(sessions)) {
+        if (sess.chatId === chatId && isUntouchedTopicSession(sess)) {
+            Object.assign(sess, patch);
+        }
+    }
+}
+
 function getSession(ctx) {
     const key = getSessionKey(ctx);
     const chatId = ctx.chat?.id?.toString() || 'default';
@@ -187,23 +247,28 @@ function getSession(ctx) {
         let topicName = null;
         if (ctx.message?.forum_topic_created?.name) {
             topicName = ctx.message.forum_topic_created.name;
+        } else if (ctx.message?.reply_to_message?.forum_topic_created?.name) {
+            topicName = ctx.message.reply_to_message.forum_topic_created.name;
         }
+        const defaults = getChatDefaults(chatId);
 
         sessions[key] = {
             id: key,
             chatId,
             threadId,
             topicName,
-            engine: process.env.DEFAULT_ENGINE || 'agy',
-            workspace: process.env.DEFAULT_WORKSPACE || process.env.DEFAULT_CWD || os.homedir(),
-            agyModel: process.env.DEFAULT_AGY_MODEL || 'gemini-3.8-flash-high',
-            grokModel: process.env.DEFAULT_GROK_MODEL || 'grok-4.7',
-            agyEffort: process.env.DEFAULT_AGY_EFFORT || '',
-            grokEffort: process.env.DEFAULT_GROK_EFFORT || '',
+            engine: defaults.engine,
+            workspace: defaults.workspace,
+            agyModel: defaults.agyModel,
+            grokModel: defaults.grokModel,
+            agyEffort: defaults.agyEffort,
+            grokEffort: defaults.grokEffort,
             agyConversationId: null,
             grokSessionId: null,
             isNew: true,
             pendingHandoff: false,
+            customTopicName: false,
+            autoTitled: false,
             activeProcess: null,
             turnCount: 0,
             createdAt: Date.now(),
@@ -211,13 +276,56 @@ function getSession(ctx) {
         };
         saveSessions();
     } else {
-        if (ctx.message?.forum_topic_created?.name) {
-            sessions[key].topicName = ctx.message.forum_topic_created.name;
+        const createdName =
+            ctx.message?.forum_topic_created?.name ||
+            ctx.message?.reply_to_message?.forum_topic_created?.name;
+        if (createdName && !sessions[key].topicName && !sessions[key].customTopicName && !sessions[key].autoTitled) {
+            sessions[key].topicName = createdName;
         }
         sessions[key].lastActive = Date.now();
     }
 
     return sessions[key];
+}
+
+async function maybeAutoRenameTopic(session, prompt = '') {
+    if (!session || !session.threadId || session.customTopicName) return false;
+    const effectivePrompt = prompt || readFirstPromptFromMemory(session.id, { memoryDir: MEMORY_DIR });
+    const currentIsGenericOrEcho =
+        isGenericTopicTitle(session.topicName) ||
+        isPromptEchoTitle(session.topicName, effectivePrompt);
+    const needsTitle = !session.autoTitled || currentIsGenericOrEcho;
+    if (!needsTitle) return false;
+
+    const { title, source } = await resolveSessionTitle(session, effectivePrompt, { memoryDir: MEMORY_DIR });
+    if (!title) return false;
+    if (title === session.topicName) {
+        if (source === 'ai' && !session.autoTitled) {
+            session.autoTitled = true;
+            saveSessions();
+        }
+        return source === 'ai';
+    }
+
+    // Only apply a fallback prompt-based title if the current topic name is still generic or a raw prompt echo
+    if (source === 'fallback' && !currentIsGenericOrEcho) {
+        return false;
+    }
+
+    try {
+        const renamed = await renameForumTopicOnTelegram(bot.telegram, session.chatId, session.threadId, title);
+        if (!renamed) return false;
+        session.topicName = title;
+        if (source === 'ai') {
+            session.autoTitled = true;
+        }
+        saveSessions();
+        console.log(`[Topics] Auto-renamed topic ${session.id} -> "${title}" (${source})`);
+        return source === 'ai';
+    } catch (err) {
+        console.error(`[Topics] Failed to auto-rename topic ${session.id}:`, err.message);
+        return false;
+    }
 }
 
 function getCurrentModel(session) {
@@ -397,7 +505,7 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
     const isInitialTopicTurn = options.isInitialTopicTurn || ctx?.state?.isInitialTopicTurn;
 
     let startStatus = `🤔 *Starting ${engineLabel} turn...*`;
-    if (isInitialTopicTurn && session.topicName) {
+    if (isInitialTopicTurn && session.topicName && !isGenericTopicTitle(session.topicName)) {
         startStatus = `🤔 *Starting ${engineLabel} turn in new topic: ${session.topicName}...*`;
     }
 
@@ -406,6 +514,14 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
         statusMsg = await ctx.reply(startStatus, { parse_mode: 'Markdown' });
     } catch {
         statusMsg = await ctx.reply(startStatus.replace(/[*_`]/g, ''));
+    }
+
+    // Rename generic topic names ('New chat', '/engine', etc.) shortly after the topic
+    // has been established with the initial status message, avoiding a race with topic creation.
+    if (session.threadId && !session.customTopicName) {
+        setTimeout(() => {
+            maybeAutoRenameTopic(session, prompt).catch(() => {});
+        }, 1500);
     }
 
     const toolCalls = [];
@@ -633,6 +749,9 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
                         session.agyConversationId = data.conversation_id;
                         session.isNew = false;
                         saveSessions();
+                        setTimeout(() => {
+                            maybeAutoRenameTopic(session, prompt).catch(() => {});
+                        }, 3000);
                     } else if (data.event === 'step_update' && data.step_update) {
                         const u = data.step_update;
 
@@ -686,6 +805,16 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             session.lastActive = Date.now();
             saveSessions();
             recordFinishedTurn(code);
+
+            maybeAutoRenameTopic(session, prompt)
+                .then((gotAiTitle) => {
+                    if (!gotAiTitle && !session.customTopicName) {
+                        setTimeout(() => {
+                            maybeAutoRenameTopic(session, prompt).catch(() => {});
+                        }, 3000);
+                    }
+                })
+                .catch(() => {});
 
             await flushUpdate(true);
 
@@ -761,7 +890,9 @@ bot.on('forum_topic_created', async (ctx) => {
     const topicName = topicInfo?.name || `Topic #${threadId}`;
 
     const session = getSession(ctx);
-    session.topicName = topicName;
+    if (!session.customTopicName && !session.autoTitled && (!session.topicName || isGenericTopicTitle(session.topicName))) {
+        session.topicName = topicName;
+    }
     saveSessions();
 
     if (chatId && threadId) {
@@ -778,15 +909,15 @@ bot.on('forum_topic_created', async (ctx) => {
 
         // If the topic was created manually (not from a prompt typed in the 'All' tab),
         // send the initialisation greeting after 2.5 seconds.
-        // If a prompt arrives within 2.5 seconds, handledPrompt becomes true and we avoid
-        // sending an unnecessary greeting before the AI answer.
+        // If a prompt or command arrives within 2.5 seconds, handledPrompt becomes true and
+        // we avoid sending an unnecessary greeting on top of the active turn.
         record.timer = setTimeout(async () => {
             const current = recentCreatedTopics.get(chatId);
-            if (current && current.threadId === threadId && !current.handledPrompt) {
+            if (current && current.threadId === threadId && !current.handledPrompt && !isSessionBusy(session) && (session.turnCount || 0) === 0) {
                 try {
                     await bot.telegram.sendMessage(
                         chatId,
-                        `🌟 *Topic Session Initialised: ${topicName}*\n\n` +
+                        `🌟 *Topic Session Initialised: ${getTopicDisplayName(session)}*\n\n` +
                         `This topic operates as an independent session.\n` +
                         `• Engine: *${getEngineLabel(session)}*\n` +
                         `• Model: \`${getCurrentModel(session)}\`\n` +
@@ -834,7 +965,7 @@ bot.command(['sessions', 'topics'], async (ctx) => {
 // /name or /topic: set or view the name of the current topic
 bot.command(['name', 'topic'], async (ctx) => {
     const session = getSession(ctx);
-    const newName = ctx.message.text.replace(/^\/(name|topic)/, '').trim();
+    const newName = sanitizeTopicTitle(ctx.message.text.replace(/^\/(name|topic)/, '').trim());
 
     if (!newName) {
         await ctx.reply(
@@ -849,7 +980,18 @@ bot.command(['name', 'topic'], async (ctx) => {
     }
 
     session.topicName = newName;
+    session.customTopicName = true;
+    session.autoTitled = true;
     saveSessions();
+
+    if (session.threadId) {
+        try {
+            await renameForumTopicOnTelegram(ctx.telegram, session.chatId, session.threadId, newName);
+        } catch (err) {
+            console.error(`[Topics] Failed to rename forum topic ${session.id} on Telegram:`, err.message);
+        }
+    }
+
     await ctx.reply(`✅ Topic name updated to: *${newName}*`, { parse_mode: 'Markdown' });
 });
 
@@ -888,6 +1030,7 @@ bot.action(/^set_engine:(agy|grok)$/, async (ctx) => {
     const session = getSession(ctx);
     const selected = ctx.match[1];
     const { resumed } = switchEngine(session, selected);
+    updateChatDefaults(session.chatId, { engine: session.engine });
     saveSessions();
 
     const continuity = resumed
@@ -958,8 +1101,10 @@ bot.action(/^set_model:(.+)$/, async (ctx) => {
     const selected = ctx.match[1];
     if (session.engine === 'grok') {
         session.grokModel = selected;
+        updateChatDefaults(session.chatId, { grokModel: selected });
     } else {
         session.agyModel = selected;
+        updateChatDefaults(session.chatId, { agyModel: selected });
     }
     saveSessions();
 
@@ -1004,8 +1149,10 @@ bot.action(/^set_effort:(.+)$/, async (ctx) => {
 
     if (session.engine === 'grok') {
         session.grokEffort = selected;
+        updateChatDefaults(session.chatId, { grokEffort: selected });
     } else {
         session.agyEffort = selected;
+        updateChatDefaults(session.chatId, { agyEffort: selected });
     }
     saveSessions();
 
@@ -1289,6 +1436,8 @@ bot.command('new', async (ctx) => {
     const archived = archiveTopicMemory(MEMORY_DIR, session.id);
     session.isNew = true;
     session.pendingHandoff = false;
+    session.customTopicName = false;
+    session.autoTitled = false;
     session.agyConversationId = null;
     session.grokSessionId = null;
     session.turnCount = 0;
@@ -1335,6 +1484,7 @@ bot.command(['workspace', 'cd'], async (ctx) => {
     }
 
     session.workspace = resolved;
+    updateChatDefaults(session.chatId, { workspace: resolved });
     saveSessions();
     await ctx.reply(`✅ Workspace for ${getTopicDisplayName(session)} updated to:\n\`${session.workspace}\``, { parse_mode: 'Markdown' });
 });
@@ -1608,8 +1758,21 @@ bot.on('text', async (ctx) => {
     }
 });
 
+async function backfillGenericTopicTitles() {
+    for (const sess of Object.values(sessions)) {
+        if (!sess.threadId || sess.customTopicName) continue;
+        const firstPrompt = readFirstPromptFromMemory(sess.id, { memoryDir: MEMORY_DIR });
+        if (!isGenericTopicTitle(sess.topicName) && !isPromptEchoTitle(sess.topicName, firstPrompt)) continue;
+        if (!sess.agyConversationId && !sess.grokSessionId && !firstPrompt) continue;
+        try {
+            await maybeAutoRenameTopic(sess, firstPrompt);
+        } catch {}
+    }
+}
+
 async function startBot() {
     loadSessions();
+    backfillGenericTopicTitles().catch(() => {});
 
     // Pre-fetch model lists in the background so the first /model is instant.
     modelCatalogue.getModels('agy').catch(() => {});
