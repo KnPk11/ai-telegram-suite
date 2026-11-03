@@ -20,9 +20,7 @@ const FALLBACK_MODELS = {
         { id: 'grok-4.7', label: 'grok-4.7', isDefault: true },
         { id: 'grok-4.7-build-fast', label: 'grok-4.7-build-fast' }
     ],
-    opencode: [
-        { id: 'opencode/big-pickle', label: 'opencode/big-pickle' }
-    ]
+    opencode: []
 };
 
 // Strip ANSI escape codes and spinner carriage-return frames.
@@ -95,6 +93,25 @@ function formatModelLabel(engine, model) {
     return `${modelIcon(engine, model)} ${model.label}${suffix}`;
 }
 
+// Telegram allows at most 100 inline buttons. One model per row, plus the
+// refresh control, so a live catalogue has to be split across pages.
+const MODEL_MENU_PAGE_SIZE = 20;
+
+function modelMenuPage(models, page = 0, pageSize = MODEL_MENU_PAGE_SIZE) {
+    const list = Array.isArray(models) ? models : [];
+    const size = Number.isInteger(pageSize) && pageSize > 0 ? pageSize : MODEL_MENU_PAGE_SIZE;
+    const pages = Math.max(1, Math.ceil(list.length / size));
+    const requested = Number.isInteger(page) ? page : 0;
+    const index = Math.min(Math.max(0, requested), pages - 1);
+    const start = index * size;
+    return {
+        models: list.slice(start, start + size),
+        page: index,
+        pages,
+        total: list.length
+    };
+}
+
 function runModelsCommand(bin, env) {
     return new Promise((resolve, reject) => {
         let stdout = '';
@@ -134,7 +151,11 @@ function createModelCatalogue({ bins, env, ttlMs = CACHE_TTL_MS, runCommand = ru
             ? parseGrokModels
             : (engine === 'opencode' ? parseOpenCodeModels : parseAgyModels);
         const output = await runCommand(bins[engine], env);
-        const models = parse(output);
+        let models = parse(output);
+        // OpenCode prints its own hosted models beside the custom provider.
+        if (engine === 'opencode') {
+            models = models.filter(model => !model.id.startsWith('opencode/'));
+        }
         if (models.length === 0) throw new Error(`no models parsed from ${engine} output`);
         return models;
     }
@@ -171,5 +192,7 @@ module.exports = {
     parseGrokModels,
     parseOpenCodeModels,
     formatModelLabel,
+    modelMenuPage,
+    MODEL_MENU_PAGE_SIZE,
     createModelCatalogue
 };

@@ -1,5 +1,6 @@
 const { Telegraf, Markup } = require('telegraf');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const readline = require('readline');
 const path = require('path');
 const fs = require('fs');
@@ -17,7 +18,8 @@ const {
 } = require('./auth');
 const {
     createModelCatalogue,
-    formatModelLabel
+    formatModelLabel,
+    modelMenuPage
 } = require('./models');
 const { buildTurnArgs, buildSlashArgs, sessionIdFor } = require('./launch');
 const { createOpenCodeState, applyOpenCodeEvent } = require('./opencode_stream');
@@ -1079,17 +1081,32 @@ bot.action(/^set_engine:(agy|grok|opencode)$/, async (ctx) => {
     );
 });
 
+// Telegram callback data is limited to 64 bytes. Long model ids get a stable
+// token that resolves back to the id for the life of this process.
+const modelTokens = new Map();
+
+function callbackForModel(id) {
+    const direct = `set_model:${id}`;
+    if (Buffer.byteLength(direct) <= 64) return direct;
+    const token = crypto.createHash('sha256').update(id).digest('hex').slice(0, 16);
+    const compact = `set_model:#${token}`;
+    if (Buffer.byteLength(compact) > 64) return null;
+    modelTokens.set(token, id);
+    return compact;
+}
+
 // /model command: inline buttons built from the live model list of the active engine
-async function buildModelMenu(session, { force = false } = {}) {
+async function buildModelMenu(session, { force = false, page = 0 } = {}) {
     const engine = normaliseEngine(session.engine);
     const { models, source } = await modelCatalogue.getModels(engine, { force });
     const activeModel = getCurrentModel(session);
+    const view = modelMenuPage(models, page);
 
     const skipped = [];
     const buttons = [];
-    for (const m of models) {
-        const data = `set_model:${m.id}`;
-        if (Buffer.byteLength(data) > 64) {
+    for (const m of view.models) {
+        const data = callbackForModel(m.id);
+        if (!data) {
             skipped.push(m.id);
             continue;
         }
@@ -1097,12 +1114,22 @@ async function buildModelMenu(session, { force = false } = {}) {
         if (label.length > 64) label = `${label.slice(0, 61)}...`;
         buttons.push([Markup.button.callback(label, data)]);
     }
+    if (view.pages > 1) {
+        const nav = [];
+        if (view.page > 0) nav.push(Markup.button.callback('◀️ Prev', `model_page:${view.page - 1}`));
+        nav.push(Markup.button.callback(`Page ${view.page + 1}/${view.pages}`, `model_page:${view.page}`));
+        if (view.page < view.pages - 1) nav.push(Markup.button.callback('Next ▶️', `model_page:${view.page + 1}`));
+        buttons.push(nav);
+    }
     buttons.push([Markup.button.callback('🔄 Refresh list', 'refresh_models')]);
 
     let text =
         `🤖 *Select AI Model (${getEngineLabel(session)})*\n` +
         `📌 *Topic:* *${getTopicDisplayName(session)}*\n` +
         `Current model: \`${activeModel}\``;
+    if (view.pages > 1) {
+        text += `\nPage ${view.page + 1} of ${view.pages} (${view.total} models).`;
+    }
     if (skipped.length) {
         text += `\n⚠️ ${skipped.length} model id(s) are too long for a Telegram button.`;
     }
@@ -1123,6 +1150,18 @@ bot.command('model', async (ctx) => {
     await ctx.reply(text, extra);
 });
 
+bot.action(/^model_page:(\d+)$/, async (ctx) => {
+    const session = getSession(ctx);
+    const page = Number(ctx.match[1]);
+    await ctx.answerCbQuery();
+    const { text, extra } = await buildModelMenu(session, { page });
+    try {
+        await ctx.editMessageText(text, extra);
+    } catch (err) {
+        if (!String(err.description || err.message).includes('not modified')) throw err;
+    }
+});
+
 bot.action('refresh_models', async (ctx) => {
     const session = getSession(ctx);
     await ctx.answerCbQuery('Refreshing model list...');
@@ -1137,7 +1176,14 @@ bot.action('refresh_models', async (ctx) => {
 
 bot.action(/^set_model:(.+)$/, async (ctx) => {
     const session = getSession(ctx);
-    const selected = ctx.match[1];
+    let selected = ctx.match[1];
+    if (selected.startsWith('#')) {
+        selected = modelTokens.get(selected.slice(1));
+        if (!selected) {
+            await ctx.answerCbQuery('Open /model again, that button has expired');
+            return;
+        }
+    }
     if (session.engine === 'grok') {
         session.grokModel = selected;
         updateChatDefaults(session.chatId, { grokModel: selected });

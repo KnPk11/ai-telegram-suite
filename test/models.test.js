@@ -106,6 +106,33 @@ test('catalogue falls back to static list, then keeps last good list on failure'
     assert.equal(stale.models.length, 3);
 });
 
+test('opencode catalogue hides OpenCode hosted models', async () => {
+    const catalogue = models.createModelCatalogue({
+        bins: { opencode: 'opencode' }, env: {}, log: silent,
+        runCommand: async () => 'opencode/big-pickle\nlocal-ai/qwen2.5-coder-7b\n'
+    });
+    const live = await catalogue.getModels('opencode');
+    assert.deepEqual(live.models.map(model => model.id), ['local-ai/qwen2.5-coder-7b']);
+});
+
+test('modelMenuPage splits a long catalogue and clamps the page', () => {
+    const list = Array.from({ length: 45 }, (_, i) => ({ id: `m${i}` }));
+    const first = models.modelMenuPage(list, 0);
+    assert.equal(first.pages, 3);
+    assert.equal(first.models.length, models.MODEL_MENU_PAGE_SIZE);
+    assert.equal(first.models[0].id, 'm0');
+
+    const last = models.modelMenuPage(list, 99);
+    assert.equal(last.page, 2);
+    assert.equal(last.models.length, 5);
+    assert.equal(last.models[0].id, 'm40');
+
+    const short = models.modelMenuPage(list.slice(0, 2), -1);
+    assert.equal(short.pages, 1);
+    assert.equal(short.page, 0);
+    assert.equal(short.models.length, 2);
+});
+
 test('catalogue treats empty parse output as a failure', async () => {
     const catalogue = models.createModelCatalogue({
         bins: { grok: 'grok' }, env: {}, log: silent,

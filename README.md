@@ -18,7 +18,7 @@ Designed specifically to solve mobile SSH pain points and provide isolated, para
 2. **Three AI Engines**:
    - **Google Antigravity (`agy`)**: Gemini 3.8 Flash, Gemini 3.1 Pro, Claude Sonnet 4.6, Claude Opus 4.6 Thinking, and GPT-OSS 120B.
    - **xAI Grok (`grok`)**: Grok 4.7, Grok 4.7 Fast, Grok 4.6, and Grok 4.5.
-   - **OpenCode (`opencode`)**: any model from `opencode models`, in `provider/model` form. Headless turns use `opencode run --auto --format json` and resume with `--session`, never `-c`.
+   - **OpenCode (`opencode`)**: models from `opencode models`, in `provider/model` form. OpenCode's own `opencode/…` models are left out of `/model`. Headless turns use `opencode run --auto --format json` and resume with `--session`, never `-c`.
    - Switch engine per topic via `/engine`. Each engine keeps its own session id, so switching back resumes that transcript.
    - After every turn the topic gets a short memory file in `memory/<chat>_<thread>.md`. That file is sent only when the destination engine has no session of its own.
    - `/new` archives the memory file and clears every engine session.
