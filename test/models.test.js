@@ -29,6 +29,20 @@ test('parseAgyModels handles tab and space separators and spinner frames', () =>
     ]);
 });
 
+test('parseOpenCodeModels keeps provider/model ids and skips prose', () => {
+    const output = [
+        'Warning: ignored',
+        'opencode/big-pickle',
+        'opencode/big-pickle',
+        'local-ai/google/gemma-4-31b',
+        'not a model'
+    ].join('\n');
+    assert.deepEqual(models.parseOpenCodeModels(output), [
+        { id: 'opencode/big-pickle', label: 'opencode/big-pickle' },
+        { id: 'local-ai/google/gemma-4-31b', label: 'local-ai/google/gemma-4-31b' }
+    ]);
+});
+
 test('parseGrokModels reads the bulleted list and flags the default', () => {
     assert.deepEqual(models.parseGrokModels(GROK_OUTPUT), [
         { id: 'grok-4.7', label: 'grok-4.7', isDefault: true },

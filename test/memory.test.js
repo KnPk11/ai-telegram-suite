@@ -84,6 +84,16 @@ test('engine switch keeps both ids and hands off only a missing destination sess
     assert.equal(current.agyConversationId, 'agy-1');
     assert.equal(current.grokSessionId, 'grok-1');
 
+    const freshOpenCode = session({ opencodeSessionId: null });
+    const openCodeHandoff = memory.switchEngine(freshOpenCode, 'opencode');
+    assert.equal(openCodeHandoff.resumed, false);
+    assert.equal(freshOpenCode.pendingHandoff, true);
+    assert.equal(freshOpenCode.agyConversationId, 'agy-1');
+
+    const resumedOpenCode = session({ opencodeSessionId: 'oc-1' });
+    assert.equal(memory.switchEngine(resumedOpenCode, 'opencode').resumed, true);
+    assert.equal(resumedOpenCode.opencodeSessionId, 'oc-1');
+
     const freshGrok = session({ grokSessionId: null });
     const handoff = memory.switchEngine(freshGrok, 'grok');
     assert.equal(handoff.resumed, false);

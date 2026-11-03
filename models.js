@@ -1,6 +1,7 @@
 'use strict';
 
-// Dynamic model catalogue for Antigravity (`agy models`) and Grok (`grok models`).
+// Dynamic model catalogue for Antigravity (`agy models`), Grok (`grok models`),
+// and OpenCode (`opencode models`).
 // Results are cached in memory; the static fallback lists are only used when the
 // CLI call fails and nothing has been fetched yet.
 
@@ -18,6 +19,9 @@ const FALLBACK_MODELS = {
     grok: [
         { id: 'grok-4.7', label: 'grok-4.7', isDefault: true },
         { id: 'grok-4.7-build-fast', label: 'grok-4.7-build-fast' }
+    ],
+    opencode: [
+        { id: 'opencode/big-pickle', label: 'opencode/big-pickle' }
     ]
 };
 
@@ -41,6 +45,20 @@ function parseAgyModels(output) {
 }
 
 // `grok models` prints a bulleted list: `  * grok-4.7 (default)` / `  - grok-4.6`.
+// `opencode models` prints one `provider/model` id per line.
+function parseOpenCodeModels(output) {
+    const models = [];
+    const seen = new Set();
+    for (const line of cleanLines(output)) {
+        const id = line.trim();
+        if (!id.includes('/') || /\s/.test(id)) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        models.push({ id, label: id });
+    }
+    return models;
+}
+
 function parseGrokModels(output) {
     const models = [];
     for (const line of cleanLines(output)) {
@@ -56,6 +74,11 @@ function modelIcon(engine, model) {
         if (model.isDefault) return '⭐';
         if (id.includes('fast')) return '🏎️';
         return '⚡';
+    }
+    if (engine === 'opencode') {
+        if (id.includes('free')) return '🆓';
+        if (id.includes('flash')) return '⚡';
+        return '🧩';
     }
     if (id.includes('argon')) return '💎';
     if (id.includes('flash')) return '⚡';
@@ -107,7 +130,9 @@ function createModelCatalogue({ bins, env, ttlMs = CACHE_TTL_MS, runCommand = ru
     const inFlight = {}; // engine -> Promise
 
     async function fetchModels(engine) {
-        const parse = engine === 'grok' ? parseGrokModels : parseAgyModels;
+        const parse = engine === 'grok'
+            ? parseGrokModels
+            : (engine === 'opencode' ? parseOpenCodeModels : parseAgyModels);
         const output = await runCommand(bins[engine], env);
         const models = parse(output);
         if (models.length === 0) throw new Error(`no models parsed from ${engine} output`);
@@ -144,6 +169,7 @@ module.exports = {
     FALLBACK_MODELS,
     parseAgyModels,
     parseGrokModels,
+    parseOpenCodeModels,
     formatModelLabel,
     createModelCatalogue
 };

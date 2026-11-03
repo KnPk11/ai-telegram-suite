@@ -19,6 +19,8 @@ const {
     createModelCatalogue,
     formatModelLabel
 } = require('./models');
+const { buildTurnArgs, buildSlashArgs, sessionIdFor } = require('./launch');
+const { createOpenCodeState, applyOpenCodeEvent } = require('./opencode_stream');
 const {
     sanitizeTopicTitle,
     isGenericTopicTitle,
@@ -39,10 +41,11 @@ const ALLOWED_CHAT_IDS = parseAllowedUserIds(process.env.ALLOWED_CHAT_IDS || pro
 const SYSTEM_PATH = process.env.SYSTEM_PATH || `${path.join(os.homedir(), '.local', 'bin')}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 const AGY_BIN = process.env.AGY_BIN || '/usr/local/bin/agy';
 const GROK_BIN = process.env.GROK_BIN || '/usr/local/bin/grok';
+const OPENCODE_BIN = process.env.OPENCODE_BIN || '/root/.opencode/bin/opencode';
 
-// Model lists are fetched live from `agy models` / `grok models` (see models.js).
+// Model lists are fetched live from each CLI (see models.js).
 const modelCatalogue = createModelCatalogue({
-    bins: { agy: AGY_BIN, grok: GROK_BIN },
+    bins: { agy: AGY_BIN, grok: GROK_BIN, opencode: OPENCODE_BIN },
     env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
 });
 
@@ -60,6 +63,15 @@ const GROK_EFFORTS = [
     { id: 'medium', label: 'Medium' },
     { id: 'high', label: 'High' },
     { id: 'xhigh', label: 'Extra High' }
+];
+
+const OPENCODE_EFFORTS = [
+    { id: '', label: 'Default' },
+    { id: 'minimal', label: 'Minimal' },
+    { id: 'low', label: 'Low' },
+    { id: 'medium', label: 'Medium' },
+    { id: 'high', label: 'High' },
+    { id: 'max', label: 'Max' }
 ];
 
 if (!BOT_TOKEN) {
@@ -87,7 +99,13 @@ function loadSessions() {
             const raw = fs.readFileSync(SESSIONS_PATH, 'utf8');
             sessions = JSON.parse(raw) || {};
             for (const key of Object.keys(sessions)) {
-                sessions[key].activeProcess = null;
+                const sess = sessions[key];
+                sess.activeProcess = null;
+                if (!sess.opencodeModel) {
+                    sess.opencodeModel = process.env.DEFAULT_OPENCODE_MODEL || 'opencode/big-pickle';
+                }
+                if (sess.opencodeEffort == null) sess.opencodeEffort = process.env.DEFAULT_OPENCODE_EFFORT || '';
+                if (sess.opencodeSessionId == null) sess.opencodeSessionId = null;
             }
             console.log(`[Sessions] Loaded ${Object.keys(sessions).length} topic sessions from storage.`);
         }
@@ -112,8 +130,11 @@ function saveSessions() {
                 grokModel: sess.grokModel,
                 agyEffort: sess.agyEffort,
                 grokEffort: sess.grokEffort,
+                opencodeModel: sess.opencodeModel,
+                opencodeEffort: sess.opencodeEffort,
                 agyConversationId: sess.agyConversationId,
                 grokSessionId: sess.grokSessionId,
+                opencodeSessionId: sess.opencodeSessionId,
                 isNew: sess.isNew,
                 pendingHandoff: Boolean(sess.pendingHandoff),
                 customTopicName: Boolean(sess.customTopicName),
@@ -209,8 +230,10 @@ function getChatDefaults(chatId) {
         workspace: mainSession?.workspace || process.env.DEFAULT_WORKSPACE || process.env.DEFAULT_CWD || os.homedir(),
         agyModel: mainSession?.agyModel || process.env.DEFAULT_AGY_MODEL || 'gemini-3.8-flash-high',
         grokModel: mainSession?.grokModel || process.env.DEFAULT_GROK_MODEL || 'grok-4.7',
+        opencodeModel: mainSession?.opencodeModel || process.env.DEFAULT_OPENCODE_MODEL || 'opencode/big-pickle',
         agyEffort: mainSession?.agyEffort ?? (process.env.DEFAULT_AGY_EFFORT || ''),
-        grokEffort: mainSession?.grokEffort ?? (process.env.DEFAULT_GROK_EFFORT || '')
+        grokEffort: mainSession?.grokEffort ?? (process.env.DEFAULT_GROK_EFFORT || ''),
+        opencodeEffort: mainSession?.opencodeEffort ?? (process.env.DEFAULT_OPENCODE_EFFORT || '')
     };
 }
 
@@ -221,6 +244,7 @@ function isUntouchedTopicSession(sess) {
         (sess.turnCount || 0) === 0 &&
         !sess.agyConversationId &&
         !sess.grokSessionId &&
+        !sess.opencodeSessionId &&
         !isSessionBusy(sess)
     );
 }
@@ -261,10 +285,13 @@ function getSession(ctx) {
             workspace: defaults.workspace,
             agyModel: defaults.agyModel,
             grokModel: defaults.grokModel,
+            opencodeModel: defaults.opencodeModel,
             agyEffort: defaults.agyEffort,
             grokEffort: defaults.grokEffort,
+            opencodeEffort: defaults.opencodeEffort,
             agyConversationId: null,
             grokSessionId: null,
+            opencodeSessionId: null,
             isNew: true,
             pendingHandoff: false,
             customTopicName: false,
@@ -328,16 +355,43 @@ async function maybeAutoRenameTopic(session, prompt = '') {
     }
 }
 
+function normaliseEngine(engine) {
+    if (engine === 'grok' || engine === 'opencode') return engine;
+    return 'agy';
+}
+
 function getCurrentModel(session) {
-    return session.engine === 'grok' ? session.grokModel : session.agyModel;
+    const engine = normaliseEngine(session.engine);
+    if (engine === 'grok') return session.grokModel;
+    if (engine === 'opencode') return session.opencodeModel;
+    return session.agyModel;
 }
 
 function getCurrentEffort(session) {
-    return session.engine === 'grok' ? session.grokEffort : session.agyEffort;
+    const engine = normaliseEngine(session.engine);
+    if (engine === 'grok') return session.grokEffort;
+    if (engine === 'opencode') return session.opencodeEffort;
+    return session.agyEffort;
 }
 
 function getEngineLabel(session) {
-    return session.engine === 'grok' ? 'xAI Grok' : 'Google Antigravity';
+    const engine = normaliseEngine(session.engine);
+    if (engine === 'grok') return 'xAI Grok';
+    if (engine === 'opencode') return 'OpenCode';
+    return 'Google Antigravity';
+}
+
+function getEngineShortLabel(session) {
+    const engine = normaliseEngine(session.engine);
+    if (engine === 'grok') return 'Grok';
+    if (engine === 'opencode') return 'OpenCode';
+    return 'Antigravity';
+}
+
+function binForEngine(engine) {
+    if (engine === 'grok') return GROK_BIN;
+    if (engine === 'opencode') return OPENCODE_BIN;
+    return AGY_BIN;
 }
 
 function getTopicDisplayName(session) {
@@ -419,21 +473,21 @@ function balanceMarkdown(text) {
 function formatToolCall(name, params = {}) {
     if (!name) return '`tool`';
 
-    if ((name === 'run_command' || name === 'run_terminal_command') && (params.CommandLine || params.command)) {
+    if ((name === 'run_command' || name === 'run_terminal_command' || name === 'bash') && (params.CommandLine || params.command)) {
         const rawCmd = params.CommandLine || params.command;
         const cmd = rawCmd.length > 45 ? rawCmd.slice(0, 42) + '...' : rawCmd;
         return `\`run_command("${cmd}")\``;
     }
-    if ((name === 'view_file' || name === 'read_file') && (params.AbsolutePath || params.path || params.file_path)) {
-        const p = params.AbsolutePath || params.path || params.file_path;
+    if ((name === 'view_file' || name === 'read_file' || name === 'read') && (params.AbsolutePath || params.path || params.file_path || params.filePath)) {
+        const p = params.AbsolutePath || params.path || params.file_path || params.filePath;
         return `\`read_file(${path.basename(p)})\``;
     }
-    if ((name === 'replace_file_content' || name === 'search_replace') && (params.TargetFile || params.path)) {
-        const p = params.TargetFile || params.path;
+    if ((name === 'replace_file_content' || name === 'search_replace' || name === 'edit') && (params.TargetFile || params.path || params.filePath)) {
+        const p = params.TargetFile || params.path || params.filePath;
         return `\`edit_file(${path.basename(p)})\``;
     }
-    if ((name === 'write_to_file' || name === 'write') && (params.TargetFile || params.path)) {
-        const p = params.TargetFile || params.path;
+    if ((name === 'write_to_file' || name === 'write') && (params.TargetFile || params.path || params.filePath)) {
+        const p = params.TargetFile || params.path || params.filePath;
         return `\`write_file(${path.basename(p)})\``;
     }
     if (name === 'list_dir' && (params.path || params.dir_path)) {
@@ -448,7 +502,7 @@ function formatToolCall(name, params = {}) {
         const shortQ = q.length > 35 ? q.slice(0, 32) + '...' : q;
         return `\`search_web("${shortQ}")\``;
     }
-    if ((name === 'read_url_content' || name === 'web_fetch') && (params.Url || params.url)) {
+    if ((name === 'read_url_content' || name === 'web_fetch' || name === 'webfetch') && (params.Url || params.url)) {
         try {
             const u = new URL(params.Url || params.url);
             return `\`web_fetch(${u.hostname})\``;
@@ -499,9 +553,10 @@ async function sendLongResponse(ctx, text) {
 // Core execution engine supporting per-topic sessions with LIVE STREAMING
 async function runAgentStreamTurn(ctx, prompt, options = {}) {
     const session = options.session || getSession(ctx);
-    const engine = options.engine || session.engine;
+    const engine = normaliseEngine(options.engine || session.engine);
     const isGrok = engine === 'grok';
-    const engineLabel = isGrok ? 'Grok' : 'Antigravity';
+    const isOpenCode = engine === 'opencode';
+    const engineLabel = getEngineShortLabel({ engine });
     const isInitialTopicTurn = options.isInitialTopicTurn || ctx?.state?.isInitialTopicTurn;
 
     let startStatus = `🤔 *Starting ${engineLabel} turn...*`;
@@ -640,69 +695,25 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
     ctx.sendChatAction('typing').catch(() => {});
 
     return new Promise((resolve) => {
-        let bin;
-        const args = [];
-
-        if (isGrok) {
-            bin = GROK_BIN;
-            args.push(
-                '--always-approve',
-                '--permission-mode', options.mode === 'plan' ? 'plan' : 'bypassPermissions',
-                '--output-format', 'streaming-json'
-            );
-
-            // Resume this topic's own Grok session. A workspace-wide continue
-            // would attach another topic that shares the same directory.
-            if (!options.isNew && session.grokSessionId) {
-                args.push('--resume', session.grokSessionId);
-            }
-
-            const model = options.model || session.grokModel;
-            if (model) {
-                args.push('-m', model);
-            }
-
-            const effort = options.effort || session.grokEffort;
-            if (effort) {
-                args.push('--effort', effort);
-            }
-
-            args.push('-p', modelPrompt);
-        } else {
-            bin = AGY_BIN;
-            args.push(
-                '--output-format', 'stream-json',
-                '--dangerously-skip-permissions'
-            );
-
-            // Resume this topic's own Antigravity conversation.
-            if (!options.isNew && session.agyConversationId) {
-                args.push('--conversation', session.agyConversationId);
-            }
-
-            const model = options.model || session.agyModel;
-            if (model) {
-                args.push('--model', model);
-            }
-
-            const effort = options.effort || session.agyEffort;
-            if (effort) {
-                args.push('--effort', effort);
-            }
-
-            if (options.mode) {
-                args.push('--mode', options.mode);
-            }
-
-            args.push('-p', modelPrompt);
-        }
+        const bin = binForEngine(engine);
+        const args = buildTurnArgs(engine, {
+            prompt: modelPrompt,
+            model: options.model || getCurrentModel({ ...session, engine }),
+            effort: options.effort || getCurrentEffort({ ...session, engine }),
+            sessionId: sessionIdFor(session, engine),
+            isNew: options.isNew,
+            mode: options.mode
+        });
+        const openCodeState = isOpenCode ? createOpenCodeState() : null;
 
         const child = spawn(bin, args, {
             cwd: session.workspace,
             env: {
                 ...process.env,
                 PATH: SYSTEM_PATH,
-                LANG: 'en_GB.UTF-8'
+                LANG: 'en_GB.UTF-8',
+                // A question tool would wait on a closed stdin and hang the topic.
+                ...(isOpenCode ? { OPENCODE_ENABLE_QUESTION_TOOL: 'false' } : {})
             }
         });
 
@@ -720,7 +731,17 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             try {
                 const data = JSON.parse(line);
 
-                if (isGrok) {
+                if (isOpenCode) {
+                    applyOpenCodeEvent(openCodeState, data);
+                    accumulatedText = openCodeState.accumulatedText;
+                    toolCalls.length = 0;
+                    toolCalls.push(...openCodeState.toolCalls);
+                    if (openCodeState.sessionId && session.opencodeSessionId !== openCodeState.sessionId) {
+                        session.opencodeSessionId = openCodeState.sessionId;
+                        session.isNew = false;
+                        saveSessions();
+                    }
+                } else if (isGrok) {
                     if (data.type === 'text' && data.data) {
                         accumulatedText += data.data;
                     } else if (data.type === 'tool_call') {
@@ -800,6 +821,9 @@ async function runAgentStreamTurn(ctx, prompt, options = {}) {
             isFinished = true;
             clearInterval(streamInterval);
             clearInterval(typingInterval);
+            if (openCodeState?.errorText && !accumulatedText.includes(openCodeState.errorText)) {
+                accumulatedText += `${accumulatedText ? '\n' : ''}[OpenCode error: ${openCodeState.errorText}]`;
+            }
             session.activeProcess = null;
             session.turnCount = (session.turnCount || 0) + 1;
             session.lastActive = Date.now();
@@ -954,8 +978,8 @@ bot.command(['sessions', 'topics'], async (ctx) => {
         const isCurrent = s.id === currentSession.id;
         const name = getTopicDisplayName(s);
         const status = isSessionBusy(s) ? '⚙️ Running' : '💤 Idle';
-        const engineLabel = s.engine === 'grok' ? 'Grok' : 'Antigravity';
-        const model = s.engine === 'grok' ? s.grokModel : s.agyModel;
+        const engineLabel = getEngineShortLabel(s);
+        const model = getCurrentModel(s);
         return `${isCurrent ? '👉 ' : '• '}*${name}* [${status}]\n   Engine: ${engineLabel} | Model: \`${model}\` | Turns: ${s.turnCount || 0}`;
     });
 
@@ -1010,6 +1034,12 @@ bot.command('engine', async (ctx) => {
                 `${session.engine === 'grok' ? '✅ ' : ''}⚡ xAI Grok`,
                 'set_engine:grok'
             )
+        ],
+        [
+            Markup.button.callback(
+                `${session.engine === 'opencode' ? '✅ ' : ''}🧩 OpenCode`,
+                'set_engine:opencode'
+            )
         ]
     ];
 
@@ -1026,7 +1056,7 @@ bot.command('engine', async (ctx) => {
     );
 });
 
-bot.action(/^set_engine:(agy|grok)$/, async (ctx) => {
+bot.action(/^set_engine:(agy|grok|opencode)$/, async (ctx) => {
     const session = getSession(ctx);
     const selected = ctx.match[1];
     const { resumed } = switchEngine(session, selected);
@@ -1051,22 +1081,31 @@ bot.action(/^set_engine:(agy|grok)$/, async (ctx) => {
 
 // /model command: inline buttons built from the live model list of the active engine
 async function buildModelMenu(session, { force = false } = {}) {
-    const engine = session.engine === 'grok' ? 'grok' : 'agy';
+    const engine = normaliseEngine(session.engine);
     const { models, source } = await modelCatalogue.getModels(engine, { force });
     const activeModel = getCurrentModel(session);
 
-    const buttons = models.map(m => [
-        Markup.button.callback(
-            `${m.id === activeModel ? '✅ ' : ''}${formatModelLabel(engine, m)}`,
-            `set_model:${m.id}`
-        )
-    ]);
+    const skipped = [];
+    const buttons = [];
+    for (const m of models) {
+        const data = `set_model:${m.id}`;
+        if (Buffer.byteLength(data) > 64) {
+            skipped.push(m.id);
+            continue;
+        }
+        let label = `${m.id === activeModel ? '✅ ' : ''}${formatModelLabel(engine, m)}`;
+        if (label.length > 64) label = `${label.slice(0, 61)}...`;
+        buttons.push([Markup.button.callback(label, data)]);
+    }
     buttons.push([Markup.button.callback('🔄 Refresh list', 'refresh_models')]);
 
     let text =
         `🤖 *Select AI Model (${getEngineLabel(session)})*\n` +
         `📌 *Topic:* *${getTopicDisplayName(session)}*\n` +
         `Current model: \`${activeModel}\``;
+    if (skipped.length) {
+        text += `\n⚠️ ${skipped.length} model id(s) are too long for a Telegram button.`;
+    }
     if (activeModel && !models.some(m => m.id === activeModel)) {
         text += `\n⚠️ Current model is no longer offered by the CLI.`;
     }
@@ -1102,6 +1141,9 @@ bot.action(/^set_model:(.+)$/, async (ctx) => {
     if (session.engine === 'grok') {
         session.grokModel = selected;
         updateChatDefaults(session.chatId, { grokModel: selected });
+    } else if (session.engine === 'opencode') {
+        session.opencodeModel = selected;
+        updateChatDefaults(session.chatId, { opencodeModel: selected });
     } else {
         session.agyModel = selected;
         updateChatDefaults(session.chatId, { agyModel: selected });
@@ -1118,8 +1160,9 @@ bot.action(/^set_model:(.+)$/, async (ctx) => {
 // /effort command: inline buttons tailored to active engine for the topic
 bot.command('effort', async (ctx) => {
     const session = getSession(ctx);
-    const isGrok = session.engine === 'grok';
-    const efforts = isGrok ? GROK_EFFORTS : AGY_EFFORTS;
+    const efforts = session.engine === 'grok'
+        ? GROK_EFFORTS
+        : (session.engine === 'opencode' ? OPENCODE_EFFORTS : AGY_EFFORTS);
     const activeEffort = getCurrentEffort(session);
 
     const buttons = [
@@ -1150,6 +1193,9 @@ bot.action(/^set_effort:(.+)$/, async (ctx) => {
     if (session.engine === 'grok') {
         session.grokEffort = selected;
         updateChatDefaults(session.chatId, { grokEffort: selected });
+    } else if (session.engine === 'opencode') {
+        session.opencodeEffort = selected;
+        updateChatDefaults(session.chatId, { opencodeEffort: selected });
     } else {
         session.agyEffort = selected;
         updateChatDefaults(session.chatId, { agyEffort: selected });
@@ -1319,7 +1365,7 @@ bot.command(['usage', 'quota'], async (ctx) => {
                     await ctx.reply(`📊 *Grok Usage*\n\`\`\`\n${stdout.trim()}\n\`\`\`${billingText}`, { parse_mode: 'Markdown' });
                 }
             });
-        } else {
+        } else if (session.engine !== 'opencode') {
             // Antigravity usage
             const p = spawn(AGY_BIN, ['-p', '/usage'], {
                 cwd: session.workspace,
@@ -1336,6 +1382,28 @@ bot.command(['usage', 'quota'], async (ctx) => {
                 clearInterval(typingInterval);
                 const output = (stdout || stderr || '*(No quota info available)*').trim();
                 await ctx.reply(`📊 *Antigravity Model Quotas & Limits*\n\n\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
+            });
+        } else {
+            const args = ['stats', '--days', '7', '--models', '8', '--project', ''];
+            const p = spawn(OPENCODE_BIN, args, {
+                cwd: session.workspace,
+                env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
+            });
+            try { p.stdin.end(); } catch {}
+            let stdout = '';
+            let stderr = '';
+            p.stdout.on('data', d => { stdout += d.toString(); });
+            p.stderr.on('data', d => { stderr += d.toString(); });
+            p.on('close', async () => {
+                clearInterval(typingInterval);
+                const output = (stdout || stderr || '*(No OpenCode stats available)*').trim();
+                const sessionLine = session.opencodeSessionId
+                    ? `\nTopic session: \`${session.opencodeSessionId}\`\n`
+                    : '\n';
+                await ctx.reply(
+                    `📊 *OpenCode Usage (last 7 days)*${sessionLine}\n\`\`\`\n${output}\n\`\`\``,
+                    { parse_mode: 'Markdown' }
+                );
             });
         }
     } catch (err) {
@@ -1365,6 +1433,21 @@ bot.command('skills', async (ctx) => {
                 clearInterval(typingInterval);
                 await ctx.reply(`🧠 *Grok Plugins & Extensions*\n\n\`\`\`\n${stdout.trim()}\n\`\`\``, { parse_mode: 'Markdown' });
             });
+        } else if (session.engine === 'opencode') {
+            const p = spawn(OPENCODE_BIN, ['debug', 'skill'], {
+                cwd: session.workspace,
+                env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
+            });
+            try { p.stdin.end(); } catch {}
+            let stdout = '';
+            let stderr = '';
+            p.stdout.on('data', d => { stdout += d.toString(); });
+            p.stderr.on('data', d => { stderr += d.toString(); });
+            p.on('close', async () => {
+                clearInterval(typingInterval);
+                const out = (stdout || stderr || 'No skills reported.').trim();
+                await ctx.reply(`🧠 *OpenCode Skills*\n\n\`\`\`\n${out}\n\`\`\``, { parse_mode: 'Markdown' });
+            });
         } else {
             const p = spawn(AGY_BIN, ['-p', '/skills'], {
                 cwd: session.workspace,
@@ -1393,7 +1476,10 @@ bot.command('agents', async (ctx) => {
     ctx.sendChatAction('typing').catch(() => {});
 
     try {
-        const p = spawn(AGY_BIN, ['-p', '/agents'], {
+        const command = session.engine === 'opencode'
+            ? [OPENCODE_BIN, ['agent', 'list']]
+            : [AGY_BIN, ['-p', '/agents']];
+        const p = spawn(command[0], command[1], {
             cwd: session.workspace,
             env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
         });
@@ -1440,6 +1526,7 @@ bot.command('new', async (ctx) => {
     session.autoTitled = false;
     session.agyConversationId = null;
     session.grokSessionId = null;
+    session.opencodeSessionId = null;
     session.turnCount = 0;
     saveSessions();
 
@@ -1625,7 +1712,7 @@ bot.command('start', async (ctx) => {
     const session = getSession(ctx);
     await ctx.reply(
         `🤖 *AI Terminal Suite*\n\n` +
-        `Interactive remote control for *Google Antigravity* (Gemini) and *xAI Grok*.\n` +
+        `Interactive remote control for *Google Antigravity* (Gemini), *xAI Grok*, and *OpenCode*.\n` +
         `Supports independent multi-session topics/threads!\n\n` +
         `📌 *Current Topic:* *${getTopicDisplayName(session)}*\n` +
         `⚙️ *Active Engine:* *${getEngineLabel(session)}*\n` +
@@ -1731,8 +1818,8 @@ bot.on('text', async (ctx) => {
         ctx.sendChatAction('typing').catch(() => {});
 
         try {
-            const bin = session.engine === 'grok' ? GROK_BIN : AGY_BIN;
-            const p = spawn(bin, ['-p', text], {
+            const engine = normaliseEngine(session.engine);
+            const p = spawn(binForEngine(engine), buildSlashArgs(engine, text), {
                 cwd: session.workspace,
                 env: { ...process.env, PATH: SYSTEM_PATH, LANG: 'en_GB.UTF-8' }
             });
@@ -1763,7 +1850,7 @@ async function backfillGenericTopicTitles() {
         if (!sess.threadId || sess.customTopicName) continue;
         const firstPrompt = readFirstPromptFromMemory(sess.id, { memoryDir: MEMORY_DIR });
         if (!isGenericTopicTitle(sess.topicName) && !isPromptEchoTitle(sess.topicName, firstPrompt)) continue;
-        if (!sess.agyConversationId && !sess.grokSessionId && !firstPrompt) continue;
+        if (!sess.agyConversationId && !sess.grokSessionId && !sess.opencodeSessionId && !firstPrompt) continue;
         try {
             await maybeAutoRenameTopic(sess, firstPrompt);
         } catch {}
@@ -1777,13 +1864,14 @@ async function startBot() {
     // Pre-fetch model lists in the background so the first /model is instant.
     modelCatalogue.getModels('agy').catch(() => {});
     modelCatalogue.getModels('grok').catch(() => {});
+    modelCatalogue.getModels('opencode').catch(() => {});
 
-    console.log(`AI Terminal Suite starting with Dual-Engine (Antigravity & Grok) and Multi-Topic support.`);
+    console.log(`AI Terminal Suite starting with Antigravity, Grok, and OpenCode, plus multi-topic support.`);
 
     // Register Telegram Menu buttons for auto-complete on mobile
     try {
         await bot.telegram.setMyCommands([
-            { command: 'engine', description: 'Switch engine (Antigravity / Grok)' },
+            { command: 'engine', description: 'Switch engine (Antigravity / Grok / OpenCode)' },
             { command: 'model', description: 'Switch AI model' },
             { command: 'sessions', description: 'List active topic sessions' },
             { command: 'name', description: 'Name or rename current topic' },

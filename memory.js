@@ -89,6 +89,7 @@ function emptyMemory(session) {
         threadId: session.threadId ?? null,
         agyConversationId: session.agyConversationId || null,
         grokSessionId: session.grokSessionId || null,
+        opencodeSessionId: session.opencodeSessionId || null,
         updatedAt: null,
         latestRequest: '',
         filesTouched: [],
@@ -111,8 +112,15 @@ function loadMemory(memoryDir, sessionId) {
     }
 }
 
+function canonicalEngine(engine) {
+    if (engine === 'grok' || engine === 'opencode') return engine;
+    return 'agy';
+}
+
 function engineLabel(engine) {
-    return engine === 'grok' ? 'Grok' : 'Antigravity';
+    if (engine === 'grok') return 'Grok';
+    if (engine === 'opencode') return 'OpenCode';
+    return 'Antigravity';
 }
 
 function renderMarkdown(state) {
@@ -136,6 +144,7 @@ function renderMarkdown(state) {
         `- Workspace: \`${state.workspace || ''}\``,
         `- Gemini conversation: \`${state.agyConversationId || 'none'}\``,
         `- Grok session: \`${state.grokSessionId || 'none'}\``,
+        `- OpenCode session: \`${state.opencodeSessionId || 'none'}\``,
         `- Updated: ${state.updatedAt || 'never'}`,
         '',
         '## Latest request',
@@ -183,6 +192,7 @@ function recordTopicTurn(memoryDir, session, turn) {
     state.threadId = session.threadId ?? state.threadId ?? null;
     state.agyConversationId = session.agyConversationId || null;
     state.grokSessionId = session.grokSessionId || null;
+    state.opencodeSessionId = session.opencodeSessionId || null;
     state.updatedAt = at;
     state.latestRequest = request;
     state.lastOutcome = outcome;
@@ -197,7 +207,7 @@ function recordTopicTurn(memoryDir, session, turn) {
 
     state.turns.push({
         at,
-        engine: turn.engine === 'grok' ? 'grok' : 'agy',
+        engine: canonicalEngine(turn.engine),
         request,
         outcome: clip(turn.outcome, TURN_OUTCOME_CLIP) || outcome
     });
@@ -247,6 +257,7 @@ function takeHandoffPrompt(session, prompt, memoryDir) {
 
 function engineHasNativeSession(session, engine) {
     if (engine === 'grok') return Boolean(session.grokSessionId);
+    if (engine === 'opencode') return Boolean(session.opencodeSessionId);
     return Boolean(session.agyConversationId);
 }
 
